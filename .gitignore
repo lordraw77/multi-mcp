@@ -1,0 +1,37 @@
+# Environment variables (sensitive data)
+.env
+.env.*
+*.env
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+venv/
+env/
+.venv/
+.env/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# NAS config (may contain credentials)
+nas_config.json
+
+# Claude Code session data
+.claude/
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
