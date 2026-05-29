@@ -21,9 +21,11 @@ from openai import OpenAI
 
 # ── Sub-agent modules (reuse Docker launchers, MCPClient, helpers) ─────────────
 sys.path.insert(0, str(Path(__file__).parent))
-import proxmox_mcp_agent as _proxmox   # P = "PROXMOX_MCP"
-import synology_mcp_agent as _synology  # P = "SYNOLOGY_MCP"
-import linux_mcp_agent as _linux        # P = "UXMCP"
+import proxmox_mcp_agent as _proxmox               # P = "PROXMOX_MCP"
+import synology_mcp_agent as _synology              # P = "SYNOLOGY_MCP"
+import linux_mcp_agent as _linux                    # P = "UXMCP"
+import homeassistant_mcp_agent as _homeassistant    # P = "HAOS_MCP"
+import watchyourlan_mcp_agent as _watchyourlan      # P = "WYLA_MCP"
 
 # ── Env ───────────────────────────────────────────────────────────────────────
 load_dotenv(Path(__file__).parent / ".env")
@@ -85,58 +87,76 @@ PROVIDERS: dict[str, dict] = {
 ROTATE_PROVIDERS = ["openrouter", "groq", "gemini", "cloudflare", "cerebras", "mistral"]
 
 
-def get_provider_keys(provider: str) -> list[str]:
-    """Return all configured API keys for a provider (primary + _2, _3, ...)."""
+def _parse_rotate_slots() -> Optional[set[int]]:
+    """Parse MAIN_AGENT_ROTATE_KEYS into a set of 1-based slot indices, or None for all.
+    E.g. "1" → {1}, "1,3" → {1, 3}, "" → None (use all)."""
+    raw = _e("ROTATE_KEYS", "").strip()
+    if not raw:
+        return None
+    slots = {int(p.strip()) for p in raw.split(",") if p.strip().isdigit()}
+    return slots if slots else None
+
+
+def get_provider_keys(provider: str, slots: Optional[set[int]] = None) -> list[tuple[int, str]]:
+    """Return (slot, key) pairs for a provider (primary + _2, _3, ...).
+    Slot is 1-based: 1 = primary key, 2 = _2, etc.
+    If slots is given, only those positions are returned; missing slots are skipped."""
     cfg = PROVIDERS.get(provider, {})
     key_var = cfg.get("api_key_var")
     if not key_var:
         return []
-    keys = []
+    all_keys: dict[int, str] = {}
     primary = os.getenv(key_var, "")
     if primary:
-        keys.append(primary)
+        all_keys[1] = primary
     n = 2
     while True:
         val = os.getenv(f"{key_var}_{n}", "")
         if not val:
             break
-        keys.append(val)
+        all_keys[n] = val
         n += 1
-    return keys
+    if slots is None:
+        return list(all_keys.items())
+    return [(s, all_keys[s]) for s in sorted(slots) if s in all_keys]
 
 
-def get_cloudflare_entries() -> list[tuple[str, str]]:
-    """Return list of (api_key, account_id) pairs for Cloudflare (primary + _2, _3, ...).
+def get_cloudflare_entries(slots: Optional[set[int]] = None) -> list[tuple[int, str, str]]:
+    """Return (slot, api_key, account_id) triples for Cloudflare (primary + _2, _3, ...).
+    If slots is given (1-based indices), only those positions are returned; missing slots are skipped.
     Entries missing either key or account_id are skipped with a warning."""
-    entries = []
-    pairs = [
-        (os.getenv(f"{P}_CLOUDFLARE_API_KEY", ""), os.getenv(f"{P}_CLOUDFLARE_ACCOUNT_ID", ""))
-    ]
+    all_pairs: dict[int, tuple[str, str]] = {}
+    key0 = os.getenv(f"{P}_CLOUDFLARE_API_KEY", "")
+    acct0 = os.getenv(f"{P}_CLOUDFLARE_ACCOUNT_ID", "")
+    if key0 or acct0:
+        all_pairs[1] = (key0, acct0)
     n = 2
     while True:
         key = os.getenv(f"{P}_CLOUDFLARE_API_KEY_{n}", "")
         acct = os.getenv(f"{P}_CLOUDFLARE_ACCOUNT_ID_{n}", "")
         if not key and not acct:
             break
-        pairs.append((key, acct))
+        all_pairs[n] = (key, acct)
         n += 1
-    for i, (key, acct) in enumerate(pairs):
-        label = "cloudflare" if i == 0 else f"cloudflare#{i + 1}"
+    selected = all_pairs if slots is None else {s: all_pairs[s] for s in sorted(slots) if s in all_pairs}
+    entries = []
+    for slot, (key, acct) in selected.items():
+        label = "cloudflare" if slot == 1 else f"cloudflare#{slot}"
         if key and acct:
-            entries.append((key, acct))
+            entries.append((slot, key, acct))
         elif key or acct:
             print(f"[warn] {label}: richiede sia API_KEY che ACCOUNT_ID — ignorato")
     return entries
 
 
-def available_providers() -> list[str]:
+def available_providers(slots: Optional[set[int]] = None) -> list[str]:
     """Return providers from ROTATE_PROVIDERS that have at least one usable entry."""
     result = []
     for name in ROTATE_PROVIDERS:
         if name == "cloudflare":
-            if get_cloudflare_entries():
+            if get_cloudflare_entries(slots):
                 result.append(name)
-        elif get_provider_keys(name):
+        elif get_provider_keys(name, slots):
             result.append(name)
     return result
 
@@ -170,21 +190,23 @@ def build_client(
 def build_pool() -> list[tuple[OpenAI, str, str]]:
     """Build rotation pool interleaved across providers (round-robin by key index).
     Result order: openrouter, groq, gemini, ..., openrouter#2, groq#2, ...
-    Cloudflare: each (api_key, account_id) pair is one entry."""
+    Cloudflare: each (api_key, account_id) pair is one entry.
+    Respects MAIN_AGENT_ROTATE_KEYS to restrict which key slots are included."""
+    slots = _parse_rotate_slots()
     per_provider: list[list[tuple[OpenAI, str, str]]] = []
-    for p in available_providers():
+    for p in available_providers(slots):
         entries: list[tuple[OpenAI, str, str]] = []
         if p == "cloudflare":
-            for i, (cf_key, cf_acct) in enumerate(get_cloudflare_entries()):
-                label = "cloudflare" if i == 0 else f"cloudflare#{i + 1}"
+            for slot, cf_key, cf_acct in get_cloudflare_entries(slots):
+                label = "cloudflare" if slot == 1 else f"cloudflare#{slot}"
                 try:
                     client, model = build_client(p, api_key=cf_key, account_id=cf_acct)
                     entries.append((client, model, label))
                 except ValueError as exc:
                     print(f"[warn] {label} ignorato: {exc}")
         else:
-            for i, key in enumerate(get_provider_keys(p)):
-                label = p if i == 0 else f"{p}#{i + 1}"
+            for slot, key in get_provider_keys(p, slots):
+                label = p if slot == 1 else f"{p}#{slot}"
                 try:
                     client, model = build_client(p, api_key=key)
                     entries.append((client, model, label))
@@ -201,6 +223,19 @@ def build_pool() -> list[tuple[OpenAI, str, str]]:
 
 # ── Generic sub-agent query runner ────────────────────────────────────────────
 NextClient = Callable[[], tuple[OpenAI, str, str]]
+DropProvider = Callable[[str], bool]
+
+_FATAL_CODES = {"organization_restricted", "account_suspended", "access_denied"}
+_FATAL_PHRASES = ("organization has been restricted", "account suspended", "access denied")
+
+
+def _is_fatal_error(exc: BadRequestError) -> tuple[bool, str]:
+    body = getattr(exc, "body", {}) or {}
+    err = body.get("error", {}) if isinstance(body, dict) else {}
+    code = err.get("code", "") or ""
+    msg_text = str(err.get("message", "")).lower()
+    fatal = code in _FATAL_CODES or any(p in msg_text for p in _FATAL_PHRASES)
+    return fatal, code
 
 
 def run_mcp_query(
@@ -209,8 +244,9 @@ def run_mcp_query(
     next_client: NextClient,
     system_prompt: str,
     query: str,
+    drop_provider: Optional[DropProvider] = None,
 ) -> str:
-    """Spawn a sub-agent Docker container, run one query through its MCP tools,
+    """Spawn a sub-agent process, run one query through its MCP tools,
     return the final text answer. next_client() is called before each LLM call
     so the rotation cycle is shared with the orchestrator."""
     proc = start_docker_fn()
@@ -238,12 +274,23 @@ def run_mcp_query(
 
         while True:
             llm, model, _ = next_client()
-            response = llm.chat.completions.create(
-                model=model,
-                messages=messages,
-                tools=openai_tools,
-                tool_choice="auto",
-            )
+            try:
+                response = llm.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    tools=openai_tools,
+                    tool_choice="auto",
+                )
+            except RateLimitError:
+                if drop_provider and drop_provider("429"):
+                    continue
+                raise
+            except BadRequestError as exc:
+                fatal, code = _is_fatal_error(exc)
+                if fatal and drop_provider and drop_provider(code or "restricted"):
+                    continue
+                raise
+
             msg = response.choices[0].message
             messages.append(_proxmox.assistant_msg(msg))
 
@@ -252,9 +299,15 @@ def run_mcp_query(
 
             for tc in msg.tool_calls:
                 fn = tc.function.name
+                raw_args = tc.function.arguments or "{}"
                 try:
-                    args = json.loads(tc.function.arguments)
+                    args = json.loads(raw_args)
                 except json.JSONDecodeError:
+                    try:
+                        args = json.loads(raw_args.rstrip() + "}")
+                    except json.JSONDecodeError:
+                        args = {}
+                if not isinstance(args, dict):
                     args = {}
 
                 preview = json.dumps(args)
@@ -278,7 +331,7 @@ def run_mcp_query(
 
 
 # ── Sub-agent handlers ────────────────────────────────────────────────────────
-def ask_proxmox(query: str, next_client: NextClient) -> str:
+def ask_proxmox(query: str, next_client: NextClient, drop_provider: Optional[DropProvider] = None) -> str:
     host = os.getenv("PROXMOX_MCP_HOST", "proxmox")
     return run_mcp_query(
         "proxmox",
@@ -290,10 +343,11 @@ def ask_proxmox(query: str, next_client: NextClient) -> str:
             "Be concise and precise. Confirm destructive or irreversible operations before executing."
         ),
         query,
+        drop_provider=drop_provider,
     )
 
 
-def ask_synology(query: str, next_client: NextClient) -> str:
+def ask_synology(query: str, next_client: NextClient, drop_provider: Optional[DropProvider] = None) -> str:
     return run_mcp_query(
         "synology",
         _synology.start_docker,
@@ -304,10 +358,11 @@ def ask_synology(query: str, next_client: NextClient) -> str:
             "Be concise and precise. Confirm destructive operations before executing."
         ),
         query,
+        drop_provider=drop_provider,
     )
 
 
-def ask_linux(query: str, next_client: NextClient) -> str:
+def ask_linux(query: str, next_client: NextClient, drop_provider: Optional[DropProvider] = None) -> str:
     servers = _linux.list_configured_servers()
     server_list = ", ".join(s.split("(")[0].strip() for s in servers) or "none configured"
     return run_mcp_query(
@@ -322,6 +377,41 @@ def ask_linux(query: str, next_client: NextClient) -> str:
             "Prefer parallel execution when running commands on multiple servers."
         ),
         query,
+        drop_provider=drop_provider,
+    )
+
+
+def ask_homeassistant(query: str, next_client: NextClient, drop_provider: Optional[DropProvider] = None) -> str:
+    ha_url = os.getenv("HAOS_MCP_URL", "(not configured)")
+    return run_mcp_query(
+        "homeassistant",
+        _homeassistant.start_proxy,
+        next_client,
+        (
+            "You are a Home Assistant smart home assistant. Use the available tools to control, "
+            f"monitor, and automate the home at {ha_url}. "
+            "You can manage lights, switches, climate, covers, media players, and other entities. "
+            "Be concise and precise. Confirm irreversible or bulk automations before executing."
+        ),
+        query,
+        drop_provider=drop_provider,
+    )
+
+
+def ask_watchyourlan(query: str, next_client: NextClient, drop_provider: Optional[DropProvider] = None) -> str:
+    wyl_url = os.getenv("WYLA_MCP_URL", "(not configured)")
+    return run_mcp_query(
+        "watchyourlan",
+        _watchyourlan.start_docker,
+        next_client,
+        (
+            "You are a network monitoring assistant with access to WatchYourLAN. "
+            f"Use the available tools to monitor the network at {wyl_url}. "
+            "You can list known devices, check online/offline status, view device history, "
+            "and manage device names and groups. Be concise and precise."
+        ),
+        query,
+        drop_provider=drop_provider,
     )
 
 # ── Orchestrator tool definitions ─────────────────────────────────────────────
@@ -391,6 +481,50 @@ ORCHESTRATOR_TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "ask_homeassistant",
+            "description": (
+                "Delegate a task to the Home Assistant smart home agent. Use for anything "
+                "related to home automation: controlling lights, switches, thermostats, climate, "
+                "covers/blinds, media players, sensors, alarms, scenes, scripts, or automations. "
+                "Also use for querying the state of any smart home device or entity."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The full task or question for the Home Assistant agent.",
+                    }
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ask_watchyourlan",
+            "description": (
+                "Delegate a task to the WatchYourLAN network monitoring agent. Use for anything "
+                "related to network device discovery and monitoring: listing known devices, "
+                "checking which devices are online or offline, viewing device history, "
+                "identifying unknown devices on the network, or managing device names and groups."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The full task or question for the WatchYourLAN agent.",
+                    }
+                },
+                "required": ["query"],
+            },
+        },
+    },
 ]
 
 
@@ -445,6 +579,8 @@ def main() -> None:
         "ask_proxmox": ask_proxmox,
         "ask_synology": ask_synology,
         "ask_linux": ask_linux,
+        "ask_homeassistant": ask_homeassistant,
+        "ask_watchyourlan": ask_watchyourlan,
     }
 
     linux_servers = _linux.list_configured_servers()
@@ -453,20 +589,26 @@ def main() -> None:
         print(f"[*] Multi-MCP Orchestrator — modalità rotazione: {names}")
     else:
         print(f"[*] Multi-MCP Orchestrator — provider: {cur_provider} — model: {model}")
-    print(f"[*] Proxmox host : {os.getenv('PROXMOX_MCP_HOST', '(not configured)')}")
-    print(f"[*] Synology NAS : {os.getenv('SYNOLOGY_MCP_NAS_CONFIG', '(not configured)')}")
-    print(f"[*] Linux servers: {len(linux_servers)} configured")
+    print(f"[*] Proxmox host      : {os.getenv('PROXMOX_MCP_HOST', '(not configured)')}")
+    print(f"[*] Synology NAS      : {os.getenv('SYNOLOGY_MCP_NAS_CONFIG', '(not configured)')}")
+    print(f"[*] Linux servers     : {len(linux_servers)} configured")
     for s in linux_servers:
         print(f"    • {s}")
+    print(f"[*] Home Assistant    : {os.getenv('HAOS_MCP_URL', '(not configured)')}")
+    print(f"[*] WatchYourLAN      : {os.getenv('WYLA_MCP_URL', '(not configured)')}")
 
     system_prompt = (
-        "You are an infrastructure orchestrator with access to three specialized agents:\n"
-        "• ask_proxmox  — manages the Proxmox VE cluster (VMs, containers, nodes, "
+        "You are an infrastructure and smart home orchestrator with access to five specialized agents:\n"
+        "• ask_proxmox       — manages the Proxmox VE cluster (VMs, containers, nodes, "
         "storage, backups, snapshots, firewall, HA, Ceph)\n"
-        "• ask_synology — manages Synology NAS devices (files, shares, Docker, packages, "
+        "• ask_synology      — manages Synology NAS devices (files, shares, Docker, packages, "
         "RAID/volume status, DSM configuration)\n"
-        "• ask_linux    — manages Linux servers via SSH (shell commands, services, logs, "
-        "processes, packages, system monitoring)\n\n"
+        "• ask_linux         — manages Linux servers via SSH (shell commands, services, logs, "
+        "processes, packages, system monitoring)\n"
+        "• ask_homeassistant — controls Home Assistant smart home (lights, switches, climate, "
+        "covers, media players, sensors, scenes, scripts, automations)\n"
+        "• ask_watchyourlan  — monitors the network via WatchYourLAN (device discovery, "
+        "online/offline status, device history, unknown device detection)\n\n"
         "Analyze each user request and delegate to the appropriate agent(s). "
         "You may call multiple agents in sequence when a task spans domains. "
         "Present the agents' responses clearly and concisely."
@@ -507,8 +649,12 @@ def main() -> None:
                 print(f"\n[error] Provider '{cur_provider}' ha restituito 429. Riprova più tardi.\n")
                 break
             except BadRequestError as exc:
-                body = getattr(exc, "body", {}) or {}
-                if isinstance(body, dict) and body.get("error", {}).get("code") == "tool_use_failed":
+                fatal, code = _is_fatal_error(exc)
+                if fatal:
+                    if _drop_provider(code or "restricted"):
+                        continue
+                    print(f"\n[error] Provider '{cur_provider}' è bloccato ({code}). Sessione terminata.\n")
+                elif code == "tool_use_failed":
                     if rotating and _cycle:
                         print(f"  [tool_use_failed] Provider '{cur_provider}' ha fallito, riprovo con il prossimo...")
                         continue
@@ -526,9 +672,15 @@ def main() -> None:
 
             for tc in msg.tool_calls:
                 fn = tc.function.name
+                raw_args = tc.function.arguments or "{}"
                 try:
-                    args = json.loads(tc.function.arguments)
+                    args = json.loads(raw_args)
                 except json.JSONDecodeError:
+                    try:
+                        args = json.loads(raw_args.rstrip() + "}")
+                    except json.JSONDecodeError:
+                        args = {}
+                if not isinstance(args, dict):
                     args = {}
 
                 query = args.get("query", "")
@@ -538,8 +690,9 @@ def main() -> None:
                 handler = dispatch.get(fn)
                 if handler:
                     try:
-                        result_text = handler(query, next_client)
+                        result_text = handler(query, next_client, _drop_provider)
                     except Exception as exc:
+                        print(f"  [{fn}] errore: {exc}", file=sys.stderr)
                         result_text = f"Sub-agent error: {exc}"
                 else:
                     result_text = f"Unknown tool: {fn}"

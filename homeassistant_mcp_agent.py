@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
-Proxmox MCP Agent
+Home Assistant MCP Agent
+Connects to the native MCP server exposed by Home Assistant (HAOS) via HTTP.
+Uses mcp-proxy to bridge HTTP→stdio so the same MCPClient pattern works.
 Provider: openrouter | groq | gemini | cloudflare | cerebras | mistral | ollama
 """
 
@@ -19,11 +21,20 @@ from openai import OpenAI
 # ── Env ───────────────────────────────────────────────────────────────────────
 ENV_FILE = Path(__file__).parent / ".env"
 load_dotenv(ENV_FILE)
-P = "PROXMOX_MCP"
+P = "HAOS_MCP"
 
 
 def _e(key: str, default: str = "") -> str:
     return os.getenv(f"{P}_{key}", default)
+
+
+def _key(var: str) -> str:
+    """Read var, falling back to the MAIN_AGENT_ equivalent if unset."""
+    val = os.getenv(var, "")
+    if val:
+        return val
+    main_var = var.replace(f"{P}_", "MAIN_AGENT_", 1)
+    return os.getenv(main_var, "")
 
 
 # ── Provider registry ─────────────────────────────────────────────────────────
@@ -47,7 +58,7 @@ PROVIDERS: dict[str, dict] = {
         "default_model": "gemini-2.0-flash",
     },
     "cloudflare": {
-        "base_url": None,  # built at runtime
+        "base_url": None,
         "api_key_var": f"{P}_CLOUDFLARE_API_KEY",
         "model_var": f"{P}_CLOUDFLARE_MODEL",
         "default_model": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
@@ -65,7 +76,7 @@ PROVIDERS: dict[str, dict] = {
         "default_model": "mistral-small-latest",
     },
     "ollama": {
-        "base_url": None,  # read from env
+        "base_url": None,
         "api_key_var": None,
         "model_var": f"{P}_OLLAMA_MODEL",
         "default_model": "llama3.2:1b",
@@ -78,25 +89,23 @@ def build_client(provider: str) -> tuple[OpenAI, str]:
         raise ValueError(f"Unknown provider '{provider}'. Valid: {', '.join(PROVIDERS)}")
 
     cfg = PROVIDERS[provider]
-
-    # Model: global override > per-provider env > hardcoded default
-    model = _e("MODEL") or os.getenv(cfg["model_var"], "") or cfg["default_model"]
+    model = _e("MODEL") or os.getenv("MAIN_AGENT_MODEL", "") or os.getenv(cfg["model_var"], "") or cfg["default_model"]
 
     if provider == "cloudflare":
-        account_id = _e("CLOUDFLARE_ACCOUNT_ID")
+        account_id = _key(f"{P}_CLOUDFLARE_ACCOUNT_ID")
         if not account_id:
-            raise ValueError(f"{P}_CLOUDFLARE_ACCOUNT_ID is required for cloudflare")
+            raise ValueError(f"{P}_CLOUDFLARE_ACCOUNT_ID (or MAIN_AGENT_CLOUDFLARE_ACCOUNT_ID) is required")
         base_url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1"
     elif provider == "ollama":
-        base_url = _e("OLLAMA_HOST", "http://localhost:11434")
+        base_url = _e("OLLAMA_HOST", "") or os.getenv("MAIN_AGENT_OLLAMA_HOST", "http://localhost:11434")
         if not base_url.rstrip("/").endswith("/v1"):
             base_url = base_url.rstrip("/") + "/v1"
     else:
         base_url = cfg["base_url"]
 
-    api_key = os.getenv(cfg["api_key_var"]) if cfg["api_key_var"] else "ollama"
+    api_key = _key(cfg["api_key_var"]) if cfg["api_key_var"] else "ollama"
     if not api_key:
-        raise ValueError(f"Missing API key: {cfg['api_key_var']}")
+        raise ValueError(f"Missing API key: {cfg['api_key_var']} (or MAIN_AGENT equivalent)")
 
     return OpenAI(base_url=base_url, api_key=api_key), model
 
@@ -170,7 +179,7 @@ class MCPClient:
         result = self._rpc("initialize", {
             "protocolVersion": "2024-11-05",
             "capabilities": {"tools": {}},
-            "clientInfo": {"name": "proxmox-mcp-agent", "version": "1.0.0"},
+            "clientInfo": {"name": "homeassistant-mcp-agent", "version": "1.0.0"},
         })
         self._notify("notifications/initialized")
         return result
@@ -230,18 +239,28 @@ def assistant_msg(msg: Any) -> dict:
     return d
 
 
-# ── Docker launcher ───────────────────────────────────────────────────────────
-def start_docker() -> subprocess.Popen:
-    image = _e("DOCKER_IMAGE", "lordraw/proxmox-mcp:latest")
-    cmd = ["docker", "run", "--rm", "-i"]
+# ── mcp-proxy launcher ────────────────────────────────────────────────────────
+def start_proxy() -> subprocess.Popen:
+    """Spawn mcp-proxy bridging the HA HTTP MCP endpoint to stdio."""
+    ha_url = _e("URL", "")
+    if not ha_url:
+        raise ValueError("HAOS_MCP_URL is required (e.g. http://192.168.1.x:8123)")
+    token = _e("TOKEN", "")
+    if not token:
+        raise ValueError("HAOS_MCP_TOKEN is required (Home Assistant long-lived access token)")
 
-    # Map PROXMOX_MCP_* vars to PROXMOX_* as expected by the container
-    for var in ("HOST", "PORT", "USER", "PASSWORD", "VERIFY_SSL", "TOKEN_ID", "TOKEN_SECRET"):
-        val = os.getenv(f"{P}_{var}")
-        if val:
-            cmd += ["-e", f"PROXMOX_{var}={val}"]
+    mcp_endpoint = ha_url.rstrip("/") + "/api/mcp"
 
-    cmd.append(image)
+    env = os.environ.copy()
+    env["API_ACCESS_TOKEN"] = token
+
+    # Use uvx so mcp-proxy runs under its own Python env (requires Python >= 3.10)
+    cmd = [
+        "uvx", "mcp-proxy",
+        "--transport=streamablehttp",
+        "--stateless",
+        mcp_endpoint,
+    ]
 
     return subprocess.Popen(
         cmd,
@@ -250,6 +269,7 @@ def start_docker() -> subprocess.Popen:
         stderr=subprocess.PIPE,
         text=True,
         bufsize=1,
+        env=env,
     )
 
 
@@ -263,12 +283,16 @@ def main() -> None:
         print(f"[error] {exc}")
         sys.exit(1)
 
-    host = _e("HOST", "unknown")
-    print(f"[*] Proxmox MCP Agent — provider: {provider} — model: {model}")
-    print(f"[*] Proxmox host: {host}:{_e('PORT', '8006')}")
-    print("[*] Starting MCP container …")
+    ha_url = _e("URL", "(not configured)")
+    print(f"[*] Home Assistant MCP Agent — provider: {provider} — model: {model}")
+    print(f"[*] Home Assistant URL: {ha_url}")
+    print("[*] Starting mcp-proxy …")
 
-    proc = start_docker()
+    try:
+        proc = start_proxy()
+    except ValueError as exc:
+        print(f"[error] {exc}")
+        sys.exit(1)
 
     def _stderr() -> None:
         if not proc.stderr:
@@ -276,7 +300,7 @@ def main() -> None:
         for line in proc.stderr:
             line = line.strip()
             if line:
-                print(f"[docker] {line}", file=sys.stderr)
+                print(f"[mcp-proxy] {line}", file=sys.stderr)
 
     threading.Thread(target=_stderr, daemon=True).start()
 
@@ -291,11 +315,11 @@ def main() -> None:
 
         openai_tools = tools_to_openai(tools)
         system_prompt = (
-            "You are a Proxmox VE administrator assistant. Use the available tools to help "
-            f"the user manage, monitor, and operate their Proxmox cluster at {host}. "
+            "You are a Home Assistant smart home assistant. Use the available tools to help "
+            f"the user control, monitor, and automate their home at {ha_url}. "
+            "You can control lights, switches, climate, covers, media players, and other entities. "
             "Be concise and precise. "
-            "For destructive or irreversible operations (delete VM, rollback snapshot, "
-            "node reboot/shutdown, format disk) always confirm with the user first."
+            "For irreversible automations or bulk changes always confirm with the user first."
         )
         messages: list[dict] = [{"role": "system", "content": system_prompt}]
 
@@ -316,7 +340,6 @@ def main() -> None:
 
             messages.append({"role": "user", "content": user_input})
 
-            # Agentic tool-call loop
             while True:
                 response = llm.chat.completions.create(
                     model=model,
