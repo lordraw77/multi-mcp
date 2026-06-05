@@ -2,7 +2,7 @@
 """
 Multi-MCP Orchestrator
 Routes requests to Proxmox, Synology NAS, or Linux SSH sub-agents.
-Provider: openrouter | groq | gemini | cloudflare | cerebras | mistral | ollama
+Provider: openrouter | groq | gemini | cloudflare | cerebras | mistral | ollama | puter
 """
 
 import os
@@ -28,7 +28,7 @@ import homeassistant_mcp_agent as _homeassistant    # P = "HAOS_MCP"
 import watchyourlan_mcp_agent as _watchyourlan      # P = "WYLA_MCP"
 
 # ── Env ───────────────────────────────────────────────────────────────────────
-load_dotenv(Path(__file__).parent / ".env")
+load_dotenv(Path(__file__).parent / ".env", override=True)
 P = "MAIN_AGENT"
 
 
@@ -74,23 +74,32 @@ PROVIDERS: dict[str, dict] = {
         "model_var": f"{P}_MISTRAL_MODEL",
         "default_model": "mistral-small-latest",
     },
+    "puter": {
+        "base_url": "https://api.puter.com/v1",
+        "api_key_var": f"{P}_PUTER_API_KEY",
+        "model_var": f"{P}_PUTER_MODEL",
+        "default_model": "gpt-4o-mini",
+    },
     "ollama": {
         "base_url": None,
         "api_key_var": None,
         "model_var": f"{P}_OLLAMA_MODEL",
         "default_model": "llama3.2:1b",
+        "chat_model_var": f"{P}_OLLAMA_CHAT_MODEL",
     },
 }
 
 
 # Providers eligible for rotation (ollama escluso: non ha API key cloud)
-ROTATE_PROVIDERS = ["openrouter", "groq", "gemini", "cloudflare", "cerebras", "mistral"]
+ROTATE_PROVIDERS = ["openrouter", "groq", "gemini", "cloudflare", "cerebras", "mistral", "puter"]
 
 
 def _parse_rotate_slots() -> Optional[set[int]]:
     """Parse MAIN_AGENT_ROTATE_KEYS into a set of 1-based slot indices, or None for all.
     E.g. "1" → {1}, "1,3" → {1, 3}, "" → None (use all)."""
     raw = _e("ROTATE_KEYS", "").strip()
+    if "#" in raw:
+        raw = raw[:raw.index("#")].strip()
     if not raw:
         return None
     slots = {int(p.strip()) for p in raw.split(",") if p.strip().isdigit()}
@@ -535,6 +544,18 @@ def main() -> None:
 
     rotating = provider.lower() in ("", "rotate", "auto")
 
+    # Ollama dual-model: separate client for final chat synthesis
+    chat_llm: Optional[OpenAI] = None
+    chat_model_name: str = ""
+    if provider.lower() == "ollama":
+        chat_model_var = _e("OLLAMA_CHAT_MODEL", "")
+        if chat_model_var:
+            chat_model_name = chat_model_var
+            ollama_host = _e("OLLAMA_HOST", "http://localhost:11434")
+            if not ollama_host.rstrip("/").endswith("/v1"):
+                ollama_host = ollama_host.rstrip("/") + "/v1"
+            chat_llm = OpenAI(base_url=ollama_host, api_key="ollama")
+
     if rotating:
         active_pool: list[tuple[OpenAI, str, str]] = build_pool()
         if not active_pool:
@@ -588,7 +609,10 @@ def main() -> None:
         names = ", ".join(label for _, _, label in active_pool)
         print(f"[*] Multi-MCP Orchestrator — modalità rotazione: {names}")
     else:
-        print(f"[*] Multi-MCP Orchestrator — provider: {cur_provider} — model: {model}")
+        if chat_llm:
+            print(f"[*] Multi-MCP Orchestrator — provider: {cur_provider} — tool model: {model} — chat model: {chat_model_name}")
+        else:
+            print(f"[*] Multi-MCP Orchestrator — provider: {cur_provider} — model: {model}")
     print(f"[*] Proxmox host      : {os.getenv('PROXMOX_MCP_HOST', '(not configured)')}")
     print(f"[*] Synology NAS      : {os.getenv('SYNOLOGY_MCP_NAS_CONFIG', '(not configured)')}")
     print(f"[*] Linux servers     : {len(linux_servers)} configured")
@@ -667,7 +691,16 @@ def main() -> None:
             messages.append(_proxmox.assistant_msg(msg))
 
             if not msg.tool_calls:
-                print(f"\nAssistant: {msg.content}\n")
+                if chat_llm:
+                    if verbose:
+                        print(f"  [llm: ollama / {chat_model_name}]")
+                    final_resp = chat_llm.chat.completions.create(
+                        model=chat_model_name,
+                        messages=messages,
+                    )
+                    print(f"\nAssistant: {final_resp.choices[0].message.content}\n")
+                else:
+                    print(f"\nAssistant: {msg.content}\n")
                 break
 
             for tc in msg.tool_calls:
