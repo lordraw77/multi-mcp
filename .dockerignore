@@ -1,0 +1,21 @@
+# Never bake secrets or local state into the image.
+.env
+*.env
+.env2
+*.env2
+nas_config.json
+.cache/
+__pycache__/
+*.py[cod]
+.git/
+.gitignore
+.claude/
+.vscode/
+.idea/
+*.log
+docker/
+README*.md
+DEPLOY.md
+Makefile
+.dockerignore
+Dockerfile

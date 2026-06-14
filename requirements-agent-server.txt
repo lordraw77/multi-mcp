@@ -1,0 +1,4 @@
+# Extra deps for the OpenAI-compatible HTTP sidecar (agent_server.py).
+# The orchestrator itself (main_agent.py) only needs: openai, python-dotenv.
+fastapi
+uvicorn[standard]

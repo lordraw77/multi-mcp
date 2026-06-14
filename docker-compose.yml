@@ -1,0 +1,40 @@
+# Multi-MCP Orchestrator — standalone deploy (web/Telegram reach it through
+# SpiceSibyl via ORCHESTRATOR_BASE_URL=http://<this-host>:8910/v1).
+#
+#   docker compose up -d --build
+#
+# The orchestrator launches its MCP sub-agents on the HOST Docker daemon
+# (Docker-out-of-Docker), so they run as sibling containers — same as the CLI.
+services:
+  orchestrator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: lordraw/multi-mcp-orchestrator:latest
+    container_name: multi-mcp-orchestrator
+    restart: unless-stopped
+    working_dir: /opt/multi-mcp
+    ports:
+      - "8910:8910"
+    env_file:
+      - .env                       # MAIN_AGENT_*, PROXMOX_MCP_*, SYNOLOGY_*, UXMCP_*, HAOS_*, WYLA_*
+    volumes:
+      # Host Docker daemon — required to spawn the MCP sub-agent containers.
+      - /var/run/docker.sock:/var/run/docker.sock
+
+      # ── Optional, only if you use these sub-agents ──────────────────────────
+      # DooD bind-mounts are resolved by the HOST daemon, and the sub-agents
+      # compute the source path from the code dir (/opt/multi-mcp). So these
+      # files MUST exist on the host at the SAME absolute path used below.
+      #
+      # Synology with nas_config.json (SYNOLOGY_MCP_NAS_CONFIG=nas_config.json):
+      #   - /opt/multi-mcp/nas_config.json:/opt/multi-mcp/nas_config.json:ro
+      #
+      # Linux SSH key auth (set UXMCP_MCP_SSH_KEY_DIR=/opt/multi-mcp/.ssh in .env):
+      #   - /opt/multi-mcp/.ssh:/opt/multi-mcp/.ssh:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0) if urllib.request.urlopen('http://localhost:8910/health').status==200 else sys.exit(1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

@@ -591,6 +591,216 @@ ORCHESTRATOR_TOOLS = [
 ]
 
 
+# ── Reusable orchestrator (shared by the CLI REPL and the HTTP sidecar) ───────
+SYSTEM_PROMPT = (
+    "You are an infrastructure and smart home orchestrator with access to five specialized agents:\n"
+    "• ask_proxmox       — manages the Proxmox VE cluster (VMs, containers, nodes, "
+    "storage, backups, snapshots, firewall, HA, Ceph)\n"
+    "• ask_synology      — manages Synology NAS devices (files, shares, Docker, packages, "
+    "RAID/volume status, DSM configuration)\n"
+    "• ask_linux         — manages Linux servers via SSH (shell commands, services, logs, "
+    "processes, packages, system monitoring)\n"
+    "• ask_homeassistant — controls Home Assistant smart home (lights, switches, climate, "
+    "covers, media players, sensors, scenes, scripts, automations)\n"
+    "• ask_watchyourlan  — monitors the network via WatchYourLAN (device discovery, "
+    "online/offline status, device history, unknown device detection)\n\n"
+    "Analyze each user request and delegate to the appropriate agent(s). "
+    "You may call multiple agents in sequence when a task spans domains. "
+    "Present the agents' responses clearly and concisely."
+)
+
+
+class Orchestrator:
+    """Reusable Multi-MCP orchestrator.
+
+    Build once, then call :meth:`run_turn` per request. Holds the provider
+    configuration (a rotation pool or a single pinned provider) read from the
+    process ``.env`` (``MAIN_AGENT_*``) — exactly the same configuration the CLI
+    uses. The HTTP sidecar (``agent_server.py``) drives one shared instance so
+    that the web console and Telegram reach the orchestrator through the gateway.
+
+    Thread-safe: :meth:`run_turn` is serialized with a lock because sub-agents
+    spawn Docker containers and the rotation pool is mutated mid-turn.
+
+    NOTE: :meth:`run_turn` mirrors the tool-call loop in :func:`main`; the REPL
+    is intentionally left untouched so standalone usage is byte-for-byte the same.
+    """
+
+    def __init__(self) -> None:
+        self.provider = _e("PROVIDER", "")
+        self.verbose = _e("VERBOSE", "true").lower() in ("true", "1", "yes")
+        self.rotating = self.provider.lower() in ("", "rotate", "auto")
+        self.system_prompt = SYSTEM_PROMPT
+        self._lock = threading.Lock()
+
+        # Ollama dual-model: separate client for final chat synthesis
+        self.chat_llm: Optional[OpenAI] = None
+        self.chat_model_name: str = ""
+        if self.provider.lower() == "ollama":
+            chat_model_var = _e("OLLAMA_CHAT_MODEL", "")
+            if chat_model_var:
+                self.chat_model_name = chat_model_var
+                ollama_host = _e("OLLAMA_HOST", "http://localhost:11434")
+                if not ollama_host.rstrip("/").endswith("/v1"):
+                    ollama_host = ollama_host.rstrip("/") + "/v1"
+                self.chat_llm = OpenAI(base_url=ollama_host, api_key="ollama")
+
+        # Non-rotating: a single fixed client (raises ValueError if misconfigured)
+        self.tool_model: str = ""
+        self._fixed_client: Optional[OpenAI] = None
+        if not self.rotating:
+            self._fixed_client, self.tool_model = build_client(self.provider)
+
+        self.dispatch = {
+            "ask_proxmox": ask_proxmox,
+            "ask_synology": ask_synology,
+            "ask_linux": ask_linux,
+            "ask_homeassistant": ask_homeassistant,
+            "ask_watchyourlan": ask_watchyourlan,
+        }
+
+        # Per-turn rotation state (reset at the start of every run_turn)
+        self._pool: list[tuple[OpenAI, str, str]] = []
+        self._cycle = None
+        self._llm: Optional[OpenAI] = None
+        self._model: str = ""
+        self._cur_provider: str = ""
+
+    # ── rotation helpers ──────────────────────────────────────────────────────
+    def pool_labels(self) -> list[str]:
+        """Provider labels currently eligible for rotation (for banners)."""
+        return [label for _, _, label in build_pool()] if self.rotating else [self.provider]
+
+    def _reset_rotation(self) -> None:
+        """Rebuild the rotation pool so each turn starts from a full, healthy set
+        (a transient 429 in one turn never permanently kills a provider)."""
+        if self.rotating:
+            self._pool = build_pool()
+            if not self._pool:
+                raise RuntimeError("Nessun provider disponibile per la rotazione (API key mancanti).")
+            self._cycle = itertools.cycle(self._pool)
+            self._llm, self._model, self._cur_provider = next(self._cycle)
+        else:
+            self._pool = []
+            self._cycle = None
+            self._llm, self._model, self._cur_provider = self._fixed_client, self.tool_model, self.provider
+
+    def _next_client(self) -> tuple[OpenAI, str, str]:
+        if self.rotating and self._cycle:
+            self._llm, self._model, self._cur_provider = next(self._cycle)
+        if self.verbose:
+            print(f"  [llm: {self._cur_provider} / {self._model}]")
+        return self._llm, self._model, self._cur_provider
+
+    def _drop_provider(self, reason: str) -> bool:
+        """Remove the current provider from this turn's pool and rebuild the cycle.
+        Returns True → caller should retry; False → pool exhausted."""
+        if not (self.rotating and self._pool):
+            return False
+        self._pool[:] = [e for e in self._pool if e[2] != self._cur_provider]
+        if not self._pool:
+            print(f"\n[error] Tutti i provider sono stati rimossi ({reason}). Turno terminato.\n")
+            return False
+        self._cycle = itertools.cycle(self._pool)
+        remaining = ", ".join(p for _, _, p in self._pool)
+        print(f"  [{reason}] Provider '{self._cur_provider}' rimosso dalla rotazione. Attivi: {remaining}")
+        return True
+
+    # ── one orchestrator turn ─────────────────────────────────────────────────
+    def run_turn(self, messages: list[dict], on_step: Optional[Callable[[dict], None]] = None) -> str:
+        """Run one orchestrator turn over ``messages`` (appended in place with the
+        assistant/tool exchange). Returns the final assistant text.
+
+        ``on_step`` — optional callback receiving ``{"type": "tool_call"|"tool_result", ...}``
+        as each sub-agent is delegated, for progress streaming.
+        """
+        with self._lock:
+            self._reset_rotation()
+
+            while True:
+                llm, model, cur_provider = self._next_client()
+
+                try:
+                    response = llm.chat.completions.create(
+                        model=model,
+                        messages=messages,
+                        tools=ORCHESTRATOR_TOOLS,
+                        tool_choice="auto",
+                    )
+                except RateLimitError:
+                    if self._drop_provider("429"):
+                        continue
+                    return f"[error] Provider '{cur_provider}' ha restituito 429. Riprova più tardi."
+                except BadRequestError as exc:
+                    fatal, code = _is_fatal_error(exc)
+                    if fatal:
+                        if self._drop_provider(code or "restricted"):
+                            continue
+                        return f"[error] Provider '{cur_provider}' è bloccato ({code})."
+                    if code == "tool_use_failed" and self.rotating and self._cycle:
+                        print(f"  [tool_use_failed] Provider '{cur_provider}' ha fallito, riprovo con il prossimo...")
+                        continue
+                    return f"[error] {cur_provider} bad request: {exc}"
+                except APIStatusError as exc:
+                    if _is_context_too_large(exc):
+                        if self._drop_provider("ctx-too-large"):
+                            continue
+                        return f"[error] Provider '{cur_provider}' context too large e nessun altro disponibile."
+                    return f"[error] {cur_provider} API error {getattr(exc, 'status_code', '?')}: {exc}"
+
+                msg = response.choices[0].message
+                messages.append(_proxmox.assistant_msg(msg))
+
+                if not msg.tool_calls:
+                    if self.chat_llm:
+                        if self.verbose:
+                            print(f"  [llm: ollama / {self.chat_model_name}]")
+                        final_resp = self.chat_llm.chat.completions.create(
+                            model=self.chat_model_name,
+                            messages=messages,
+                        )
+                        return final_resp.choices[0].message.content or "(no response)"
+                    return msg.content or "(no response)"
+
+                for tc in msg.tool_calls:
+                    fn = tc.function.name
+                    raw_args = tc.function.arguments or "{}"
+                    try:
+                        args = json.loads(raw_args)
+                    except json.JSONDecodeError:
+                        try:
+                            args = json.loads(raw_args.rstrip() + "}")
+                        except json.JSONDecodeError:
+                            args = {}
+                    if not isinstance(args, dict):
+                        args = {}
+
+                    query = args.get("query", "")
+                    short = query[:80] + ("…" if len(query) > 80 else "")
+                    print(f"  → [{fn}] {short}")
+                    if on_step:
+                        on_step({"type": "tool_call", "id": tc.id, "name": fn, "query": query})
+
+                    handler = self.dispatch.get(fn)
+                    if handler:
+                        try:
+                            result_text = handler(query, self._next_client, self._drop_provider)
+                        except Exception as exc:
+                            print(f"  [{fn}] errore: {exc}", file=sys.stderr)
+                            result_text = f"Sub-agent error: {exc}"
+                    else:
+                        result_text = f"Unknown tool: {fn}"
+
+                    if on_step:
+                        on_step({"type": "tool_result", "id": tc.id, "name": fn, "result": result_text})
+
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": result_text,
+                    })
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main() -> None:
     provider = _e("PROVIDER", "")
