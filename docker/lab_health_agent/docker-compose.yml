@@ -1,0 +1,26 @@
+# Avvio:  docker compose -f docker/lab_health_agent/docker-compose.yml up -d --build
+# Usa il .env nella root del progetto (env_file + bind mount del progetto).
+services:
+  lab-health-agent:
+    build:
+      context: ../..
+      dockerfile: docker/lab_health_agent/Dockerfile
+    image: multi-mcp/lab-health-agent:latest
+    container_name: lab-health-agent
+    restart: unless-stopped
+    env_file:
+      - ../../.env
+    environment:
+      - TZ=Europe/Rome
+      # Run only at these times (local/Rome time) instead of at startup + interval
+      - LAB_HEALTH_SCHEDULE_TIMES=06:00,19:00
+    volumes:
+      # Socket Docker del host: serve per lanciare i container MCP dei sub-agent
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Progetto montato sullo stesso path del host, così i `-v` generati
+      # dai sub-agent (es. nas_config.json) puntano a file esistenti sul host
+      - ../..:/opt/multi-mcp
+      # Chiavi SSH per linux_mcp (stesso path host/container)
+      - /root/.ssh:/root/.ssh:ro
+    working_dir: /opt/multi-mcp
+    command: ["python", "lab_health_agent.py"]

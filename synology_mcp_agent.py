@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Synology NAS MCP Agent
-Provider: openrouter | groq | gemini | cloudflare | cerebras | mistral | ollama
+Provider: openrouter | groq | gemini | cloudflare | cerebras | mistral | nvidia | ollama
 """
 
 import os
@@ -15,6 +15,8 @@ from typing import Any, Optional
 
 from dotenv import load_dotenv
 from openai import OpenAI
+
+from nvidia_ratelimit import wrap_if_nvidia
 
 # ── Env ───────────────────────────────────────────────────────────────────────
 load_dotenv(Path(__file__).parent / ".env")
@@ -62,6 +64,11 @@ PROVIDERS: dict[str, dict] = {
         "api_key_var": f"{P}_MISTRAL_API_KEY",
         "default_model": "mistral-small-latest",
     },
+    "nvidia": {
+        "base_url": "https://integrate.api.nvidia.com/v1",
+        "api_key_var": f"{P}_NVIDIA_API_KEY",
+        "default_model": "meta/llama-3.3-70b-instruct",
+    },
     "ollama": {
         "base_url": None,  # built at runtime
         "api_key_var": None,
@@ -92,7 +99,8 @@ def build_client(provider: str) -> tuple[OpenAI, str]:
     if not api_key:
         raise ValueError(f"Missing API key: {cfg['api_key_var']}")
 
-    return OpenAI(base_url=base_url, api_key=api_key), model
+    client = OpenAI(base_url=base_url, api_key=api_key)
+    return wrap_if_nvidia(provider, client, api_key), model
 
 
 # ── MCP stdio client ───────────────────────────────────────────────────────────

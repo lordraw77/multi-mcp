@@ -1,0 +1,26 @@
+# Avvio:  docker compose -f docker/linux_update_agent/docker-compose.yml up -d --build
+# Usa il .env nella root del progetto (env_file + bind mount del progetto).
+services:
+  linux-update-agent:
+    build:
+      context: ../..
+      dockerfile: docker/linux_update_agent/Dockerfile
+    image: multi-mcp/linux-update-agent:latest
+    container_name: linux-update-agent
+    restart: unless-stopped
+    env_file:
+      - ../../.env
+    environment:
+      - TZ=Europe/Rome
+      # Run only at this time (local/Rome time) instead of at startup + interval
+      - LINUX_UPDATE_SCHEDULE_TIMES=12:00
+    volumes:
+      # Socket Docker del host: serve per lanciare il container MCP linux
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Progetto montato sullo stesso path del host, così i `-v` generati
+      # dai sub-agent puntano a file esistenti sul host
+      - ../..:/opt/multi-mcp
+      # Chiavi SSH per linux_mcp (stesso path host/container)
+      - /root/.ssh:/root/.ssh:ro
+    working_dir: /opt/multi-mcp
+    command: ["python", "linux_update_agent.py"]

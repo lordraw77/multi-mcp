@@ -2,7 +2,7 @@
 """
 Multi-MCP Orchestrator
 Routes requests to Proxmox, Synology NAS, or Linux SSH sub-agents.
-Provider: openrouter | groq | gemini | cloudflare | cerebras | mistral | ollama | puter
+Provider: openrouter | groq | gemini | cloudflare | cerebras | mistral | nvidia | ollama | puter
 """
 
 import os
@@ -14,10 +14,12 @@ import threading
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from openai import BadRequestError, RateLimitError
+from openai import BadRequestError, RateLimitError, APIStatusError
 
 from dotenv import load_dotenv
 from openai import OpenAI
+
+from nvidia_ratelimit import wrap_if_nvidia
 
 # ── Sub-agent modules (reuse Docker launchers, MCPClient, helpers) ─────────────
 sys.path.insert(0, str(Path(__file__).parent))
@@ -74,6 +76,12 @@ PROVIDERS: dict[str, dict] = {
         "model_var": f"{P}_MISTRAL_MODEL",
         "default_model": "mistral-small-latest",
     },
+    "nvidia": {
+        "base_url": "https://integrate.api.nvidia.com/v1",
+        "api_key_var": f"{P}_NVIDIA_API_KEY",
+        "model_var": f"{P}_NVIDIA_MODEL",
+        "default_model": "meta/llama-3.3-70b-instruct",
+    },
     "puter": {
         "base_url": "https://api.puter.com/v1",
         "api_key_var": f"{P}_PUTER_API_KEY",
@@ -91,7 +99,7 @@ PROVIDERS: dict[str, dict] = {
 
 
 # Providers eligible for rotation (ollama escluso: non ha API key cloud)
-ROTATE_PROVIDERS = ["openrouter", "groq", "gemini", "cloudflare", "cerebras", "mistral", "puter"]
+ROTATE_PROVIDERS = ["openrouter", "groq", "gemini", "cloudflare", "cerebras", "mistral", "nvidia", "puter"]
 
 
 def _parse_rotate_slots() -> Optional[set[int]]:
@@ -193,7 +201,32 @@ def build_client(
     resolved_key = api_key or (os.getenv(cfg["api_key_var"]) if cfg["api_key_var"] else "ollama")
     if not resolved_key:
         raise ValueError(f"Missing API key: {cfg['api_key_var']}")
-    return OpenAI(base_url=base_url, api_key=resolved_key), model
+    client = OpenAI(base_url=base_url, api_key=resolved_key)
+    return wrap_if_nvidia(provider, client, resolved_key), model
+
+
+def _provider_entries(provider: str, slots: Optional[set[int]] = None) -> list[tuple[OpenAI, str, str]]:
+    """Build all (client, model, label) entries for a single provider across its key slots.
+    Cloudflare: each (api_key, account_id) pair is one entry.
+    Respects the given slot filter (from MAIN_AGENT_ROTATE_KEYS)."""
+    entries: list[tuple[OpenAI, str, str]] = []
+    if provider == "cloudflare":
+        for slot, cf_key, cf_acct in get_cloudflare_entries(slots):
+            label = "cloudflare" if slot == 1 else f"cloudflare#{slot}"
+            try:
+                client, model = build_client(provider, api_key=cf_key, account_id=cf_acct)
+                entries.append((client, model, label))
+            except ValueError as exc:
+                print(f"[warn] {label} ignorato: {exc}")
+    else:
+        for slot, key in get_provider_keys(provider, slots):
+            label = provider if slot == 1 else f"{provider}#{slot}"
+            try:
+                client, model = build_client(provider, api_key=key)
+                entries.append((client, model, label))
+            except ValueError as exc:
+                print(f"[warn] {label} ignorato: {exc}")
+    return entries
 
 
 def build_pool() -> list[tuple[OpenAI, str, str]]:
@@ -204,23 +237,7 @@ def build_pool() -> list[tuple[OpenAI, str, str]]:
     slots = _parse_rotate_slots()
     per_provider: list[list[tuple[OpenAI, str, str]]] = []
     for p in available_providers(slots):
-        entries: list[tuple[OpenAI, str, str]] = []
-        if p == "cloudflare":
-            for slot, cf_key, cf_acct in get_cloudflare_entries(slots):
-                label = "cloudflare" if slot == 1 else f"cloudflare#{slot}"
-                try:
-                    client, model = build_client(p, api_key=cf_key, account_id=cf_acct)
-                    entries.append((client, model, label))
-                except ValueError as exc:
-                    print(f"[warn] {label} ignorato: {exc}")
-        else:
-            for slot, key in get_provider_keys(p, slots):
-                label = p if slot == 1 else f"{p}#{slot}"
-                try:
-                    client, model = build_client(p, api_key=key)
-                    entries.append((client, model, label))
-                except ValueError as exc:
-                    print(f"[warn] {label} ignorato: {exc}")
+        entries = _provider_entries(p, slots)
         if entries:
             per_provider.append(entries)
     # Round-robin: slot 0 of each provider, then slot 1, etc.
@@ -230,12 +247,32 @@ def build_pool() -> list[tuple[OpenAI, str, str]]:
     return result
 
 
+def build_single_pool(provider: str) -> list[tuple[OpenAI, str, str]]:
+    """Build a pool restricted to one named provider (all its usable key slots).
+    Used when an agent pins a specific provider: failover happens only between that
+    provider's own keys — never across different providers. No rotation if it has one key.
+    Respects MAIN_AGENT_ROTATE_KEYS to restrict which key slots are included."""
+    if provider not in PROVIDERS:
+        raise ValueError(f"Unknown provider '{provider}'. Valid: {', '.join(PROVIDERS)}")
+    return _provider_entries(provider, _parse_rotate_slots())
+
+
 # ── Generic sub-agent query runner ────────────────────────────────────────────
 NextClient = Callable[[], tuple[OpenAI, str, str]]
 DropProvider = Callable[[str], bool]
 
 _FATAL_CODES = {"organization_restricted", "account_suspended", "access_denied"}
 _FATAL_PHRASES = ("organization has been restricted", "account suspended", "access denied")
+_CTX_TOO_LARGE_PHRASES = (
+    "request too large", "reduce your message size", "maximum context length",
+    "prompt is too long", "context_length_exceeded", "context length exceeded",
+    "tokens per minute", "input is too long",
+)
+
+def _is_context_too_large(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    status = getattr(exc, "status_code", 0)
+    return status == 413 or any(p in msg for p in _CTX_TOO_LARGE_PHRASES)
 
 
 def _is_fatal_error(exc: BadRequestError) -> tuple[bool, str]:
@@ -254,6 +291,8 @@ def run_mcp_query(
     system_prompt: str,
     query: str,
     drop_provider: Optional[DropProvider] = None,
+    max_tokens: Optional[int] = None,
+    max_tool_result_chars: Optional[int] = None,
 ) -> str:
     """Spawn a sub-agent process, run one query through its MCP tools,
     return the final text answer. next_client() is called before each LLM call
@@ -284,12 +323,10 @@ def run_mcp_query(
         while True:
             llm, model, _ = next_client()
             try:
-                response = llm.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    tools=openai_tools,
-                    tool_choice="auto",
-                )
+                kw: dict = dict(model=model, messages=messages, tools=openai_tools, tool_choice="auto")
+                if max_tokens:
+                    kw["max_tokens"] = max_tokens
+                response = llm.chat.completions.create(**kw)
             except RateLimitError:
                 if drop_provider and drop_provider("429"):
                     continue
@@ -297,6 +334,10 @@ def run_mcp_query(
             except BadRequestError as exc:
                 fatal, code = _is_fatal_error(exc)
                 if fatal and drop_provider and drop_provider(code or "restricted"):
+                    continue
+                raise
+            except APIStatusError as exc:
+                if _is_context_too_large(exc) and drop_provider and drop_provider("ctx-too-large"):
                     continue
                 raise
 
@@ -330,6 +371,9 @@ def run_mcp_query(
                 except Exception as exc:
                     result_text = f"Tool error: {exc}"
 
+                if max_tool_result_chars and len(result_text) > max_tool_result_chars:
+                    result_text = result_text[:max_tool_result_chars] + f"\n… [truncated to {max_tool_result_chars} chars]"
+
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
@@ -340,7 +384,7 @@ def run_mcp_query(
 
 
 # ── Sub-agent handlers ────────────────────────────────────────────────────────
-def ask_proxmox(query: str, next_client: NextClient, drop_provider: Optional[DropProvider] = None) -> str:
+def ask_proxmox(query: str, next_client: NextClient, drop_provider: Optional[DropProvider] = None, max_tokens: Optional[int] = None, max_tool_result_chars: Optional[int] = None) -> str:
     host = os.getenv("PROXMOX_MCP_HOST", "proxmox")
     return run_mcp_query(
         "proxmox",
@@ -353,10 +397,12 @@ def ask_proxmox(query: str, next_client: NextClient, drop_provider: Optional[Dro
         ),
         query,
         drop_provider=drop_provider,
+        max_tokens=max_tokens,
+        max_tool_result_chars=max_tool_result_chars,
     )
 
 
-def ask_synology(query: str, next_client: NextClient, drop_provider: Optional[DropProvider] = None) -> str:
+def ask_synology(query: str, next_client: NextClient, drop_provider: Optional[DropProvider] = None, max_tokens: Optional[int] = None, max_tool_result_chars: Optional[int] = None) -> str:
     return run_mcp_query(
         "synology",
         _synology.start_docker,
@@ -368,10 +414,12 @@ def ask_synology(query: str, next_client: NextClient, drop_provider: Optional[Dr
         ),
         query,
         drop_provider=drop_provider,
+        max_tokens=max_tokens,
+        max_tool_result_chars=max_tool_result_chars,
     )
 
 
-def ask_linux(query: str, next_client: NextClient, drop_provider: Optional[DropProvider] = None) -> str:
+def ask_linux(query: str, next_client: NextClient, drop_provider: Optional[DropProvider] = None, max_tokens: Optional[int] = None, max_tool_result_chars: Optional[int] = None) -> str:
     servers = _linux.list_configured_servers()
     server_list = ", ".join(s.split("(")[0].strip() for s in servers) or "none configured"
     return run_mcp_query(
@@ -387,10 +435,12 @@ def ask_linux(query: str, next_client: NextClient, drop_provider: Optional[DropP
         ),
         query,
         drop_provider=drop_provider,
+        max_tokens=max_tokens,
+        max_tool_result_chars=max_tool_result_chars,
     )
 
 
-def ask_homeassistant(query: str, next_client: NextClient, drop_provider: Optional[DropProvider] = None) -> str:
+def ask_homeassistant(query: str, next_client: NextClient, drop_provider: Optional[DropProvider] = None, max_tokens: Optional[int] = None, max_tool_result_chars: Optional[int] = None) -> str:
     ha_url = os.getenv("HAOS_MCP_URL", "(not configured)")
     return run_mcp_query(
         "homeassistant",
@@ -404,10 +454,12 @@ def ask_homeassistant(query: str, next_client: NextClient, drop_provider: Option
         ),
         query,
         drop_provider=drop_provider,
+        max_tokens=max_tokens,
+        max_tool_result_chars=max_tool_result_chars,
     )
 
 
-def ask_watchyourlan(query: str, next_client: NextClient, drop_provider: Optional[DropProvider] = None) -> str:
+def ask_watchyourlan(query: str, next_client: NextClient, drop_provider: Optional[DropProvider] = None, max_tokens: Optional[int] = None, max_tool_result_chars: Optional[int] = None) -> str:
     wyl_url = os.getenv("WYLA_MCP_URL", "(not configured)")
     return run_mcp_query(
         "watchyourlan",
@@ -421,6 +473,8 @@ def ask_watchyourlan(query: str, next_client: NextClient, drop_provider: Optiona
         ),
         query,
         drop_provider=drop_provider,
+        max_tokens=max_tokens,
+        max_tool_result_chars=max_tool_result_chars,
     )
 
 # ── Orchestrator tool definitions ─────────────────────────────────────────────
@@ -685,6 +739,14 @@ def main() -> None:
                     print(f"\n[error] Provider '{cur_provider}' ha fallito la generazione del tool call.\n")
                 else:
                     print(f"\n[error] {cur_provider} bad request: {exc}\n")
+                break
+            except APIStatusError as exc:
+                if _is_context_too_large(exc):
+                    if _drop_provider("ctx-too-large"):
+                        continue
+                    print(f"\n[error] Provider '{cur_provider}' context too large e nessun altro disponibile.\n")
+                else:
+                    print(f"\n[error] {cur_provider} API error {getattr(exc, 'status_code', '?')}: {exc}\n")
                 break
 
             msg = response.choices[0].message
