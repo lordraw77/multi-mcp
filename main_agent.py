@@ -9,7 +9,6 @@ import os
 import sys
 import json
 import itertools
-import importlib
 from itertools import zip_longest
 import threading
 from pathlib import Path
@@ -398,9 +397,35 @@ ORCHESTRATOR_TOOLS = [a.tool_def for a in AGENTS]
 DISPATCH = {a.tool_name: a.handler for a in AGENTS}
 
 # The orchestrator serializes its own assistant messages with assistant_msg(),
-# identical across every *_mcp_agent module. Borrow it from any loaded agent,
-# with a safe fallback so the module still imports when agents.d/ is empty.
-_MCP = AGENTS[0].module if AGENTS else importlib.import_module("proxmox_mcp_agent")
+# identical across every *_mcp_agent module. Borrow it from any loaded agent.
+# When agents.d/ is empty there is no module to borrow from, so fall back to a
+# local copy of that (module-agnostic) serializer — the orchestrator must still
+# import cleanly and surface a readable "no agents" error rather than crash with
+# a ModuleNotFoundError on a hard-coded agent name.
+class _FallbackMCP:
+    @staticmethod
+    def assistant_msg(msg: Any) -> dict:
+        d: dict = {"role": "assistant", "content": msg.content or ""}
+        if msg.tool_calls:
+            d["tool_calls"] = [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                }
+                for tc in msg.tool_calls
+            ]
+        return d
+
+
+_MCP = AGENTS[0].module if AGENTS else _FallbackMCP
+if not AGENTS:
+    print(
+        "[warn] nessun sub-agent caricato da agents.d/ — l'orchestrator parte ma "
+        "non può delegare nulla. Controlla il bind-mount di agents.d/ "
+        "(dev'essere completo: *.json + *_mcp_agent.py) o MAIN_AGENT_AGENTS_DIR.",
+        file=sys.stderr,
+    )
 
 
 # ── Reusable orchestrator (shared by the CLI REPL and the HTTP sidecar) ───────
