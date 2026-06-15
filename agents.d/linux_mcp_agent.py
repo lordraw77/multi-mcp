@@ -16,10 +16,16 @@ from typing import Any, Optional
 from dotenv import load_dotenv
 from openai import OpenAI
 
+# This sub-agent may run from agents.d/ or standalone — make the repo root
+# (shared modules like nvidia_ratelimit, and the shared .env) importable.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 from nvidia_ratelimit import wrap_if_nvidia
 
 # ── Env ───────────────────────────────────────────────────────────────────────
-ENV_FILE = Path(__file__).parent / ".env"
+ENV_FILE = _REPO_ROOT / ".env"
 load_dotenv(ENV_FILE)
 P = "UXMCP"
 
@@ -290,6 +296,17 @@ def list_configured_servers() -> list[str]:
         servers.append(f"{label} ({host})")
         i += 1
     return servers
+
+
+def prompt_context() -> dict[str, str]:
+    """Substitution variables for the orchestrator agent registry ({ctx:...}).
+
+    ``servers`` → comma-separated list of configured server labels (host part
+    dropped), or ``none configured``. Mirrors the prompt/banner string the
+    orchestrator used to build inline for the Linux sub-agent."""
+    servers = list_configured_servers()
+    server_list = ", ".join(s.split("(")[0].strip() for s in servers) or "none configured"
+    return {"servers": server_list}
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────

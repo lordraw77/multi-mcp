@@ -18,10 +18,16 @@ from typing import Any, Optional
 from dotenv import load_dotenv
 from openai import OpenAI
 
+# This sub-agent may run from agents.d/ or standalone — make the repo root
+# (shared modules like nvidia_ratelimit, and the shared .env) importable.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 from nvidia_ratelimit import wrap_if_nvidia
 
 # ── Env ───────────────────────────────────────────────────────────────────────
-ENV_FILE = Path(__file__).parent / ".env"
+ENV_FILE = _REPO_ROOT / ".env"
 load_dotenv(ENV_FILE)
 P = "HAOS_MCP"
 

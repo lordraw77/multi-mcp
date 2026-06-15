@@ -21,13 +21,16 @@ over uniformly.
 
 | File | Role |
 |------|------|
-| [`main_agent.py`](../main_agent.py) | Orchestrator: provider registry, rotation pool, the `ask_*` handlers, the [`Orchestrator`](CLASSES.md#orchestrator) class, and the CLI REPL (`main`). |
+| [`main_agent.py`](../main_agent.py) | Orchestrator: provider registry, rotation pool, the registry-driven sub-agent dispatch, the [`Orchestrator`](CLASSES.md#orchestrator) class, and the CLI REPL (`main`). |
+| [`agent_registry.py`](../agent_registry.py) | Discovers and imports sub-agents from `agents.d/*.json` at runtime; builds the tool defs, dispatch map and system prompt. |
+| [`agents.d/`](../agents.d/) | One JSON per sub-agent (and optionally its `.py`) — add/remove an agent without touching the orchestrator (bind-mountable in Docker). |
+| [`mcp_common.py`](../mcp_common.py) | Shared MCP plumbing (`MCPClient` + helpers + `docker_start`) so externalized agents stay thin. |
 | [`agent_server.py`](../agent_server.py) | FastAPI sidecar exposing an OpenAI-compatible `POST /v1/chat/completions` backed by one shared `Orchestrator`. |
-| [`proxmox_mcp_agent.py`](../proxmox_mcp_agent.py) | Proxmox VE sub-agent + standalone CLI. Hosts the canonical [`MCPClient`](CLASSES.md#mcpclient) and helper functions reused by the orchestrator. |
-| [`synology_mcp_agent.py`](../synology_mcp_agent.py) | Synology NAS sub-agent + standalone CLI. |
-| [`linux_mcp_agent.py`](../linux_mcp_agent.py) | Linux SSH fleet sub-agent + standalone CLI; also exposes `list_configured_servers()`. |
-| [`homeassistant_mcp_agent.py`](../homeassistant_mcp_agent.py) | Home Assistant sub-agent; bridges HA's HTTP MCP endpoint to stdio with `uvx mcp-proxy`. |
-| [`watchyourlan_mcp_agent.py`](../watchyourlan_mcp_agent.py) | WatchYourLAN network-monitoring sub-agent; adds schema cleaning for strict providers. |
+| [`proxmox_mcp_agent.py`](../agents.d/proxmox_mcp_agent.py) | Proxmox VE sub-agent + standalone CLI. Hosts the canonical [`MCPClient`](CLASSES.md#mcpclient) and helper functions reused by the orchestrator. |
+| [`synology_mcp_agent.py`](../agents.d/synology_mcp_agent.py) | Synology NAS sub-agent + standalone CLI. |
+| [`linux_mcp_agent.py`](../agents.d/linux_mcp_agent.py) | Linux SSH fleet sub-agent + standalone CLI; also exposes `list_configured_servers()`. |
+| [`homeassistant_mcp_agent.py`](../agents.d/homeassistant_mcp_agent.py) | Home Assistant sub-agent; bridges HA's HTTP MCP endpoint to stdio with `uvx mcp-proxy`. |
+| [`watchyourlan_mcp_agent.py`](../agents.d/watchyourlan_mcp_agent.py) | WatchYourLAN network-monitoring sub-agent; adds schema cleaning for strict providers. |
 | [`lab_health_agent.py`](../lab_health_agent.py) | Autonomous, read-only health checker (ReAct loop → Telegram report). |
 | [`linux_update_agent.py`](../linux_update_agent.py) | Autonomous package updater for the Linux fleet (check → upgrade → report). |
 | [`nvidia_ratelimit.py`](../nvidia_ratelimit.py) | Cross-process rate limiter for the NVIDIA NIM free tier. |
@@ -47,8 +50,8 @@ the REPL loop in `main_agent.main`):
    in the cycle.
 3. **No tool calls?** → return the assistant text (optionally re-synthesised by a
    separate Ollama chat model). Done.
-4. **Tool calls?** → for each call, dispatch to the matching `ask_*` handler. The
-   handler runs `run_mcp_query`, which:
+4. **Tool calls?** → for each call, dispatch via `DISPATCH` to the matching
+   registry handler. The handler runs `run_mcp_query`, which:
    a. spawns the MCP server process (`start_docker` / `start_proxy`),
    b. initialises MCP and lists tools,
    c. runs an inner loop: LLM ↔ MCP `tools/call` until the sub-agent LLM stops
@@ -117,9 +120,10 @@ Three module-level helpers adapt MCP to the OpenAI Chat Completions shape:
 - `assistant_msg(msg)` — serialise an OpenAI assistant message (with tool calls)
   back into a `messages`-list dict.
 
-The orchestrator reuses the **proxmox** module's copies of these
-(`run_mcp_query` calls `_proxmox.MCPClient`, `_proxmox.tools_to_openai`, etc.)
-since they are byte-for-byte identical across modules.
+`run_mcp_query` calls these on **each sub-agent's own module** (`mcp_module.MCPClient`,
+`mcp_module.tools_to_openai`, …), so there is no hard dependency on any single
+agent. The canonical copies also live in [`mcp_common.py`](../mcp_common.py) for
+externalized agents to import instead of re-implementing.
 
 > **WatchYourLAN exception:** `watchyourlan_mcp_agent.tools_to_openai` runs each
 > schema through `_clean_schema()` first, stripping `title`/`default` keys and

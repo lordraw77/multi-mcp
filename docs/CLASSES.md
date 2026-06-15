@@ -51,11 +51,11 @@ mid-turn.
 ## `MCPClient`
 
 **File:** present identically in
-[`proxmox_mcp_agent.py`](../proxmox_mcp_agent.py),
-[`synology_mcp_agent.py`](../synology_mcp_agent.py),
-[`linux_mcp_agent.py`](../linux_mcp_agent.py),
-[`homeassistant_mcp_agent.py`](../homeassistant_mcp_agent.py),
-[`watchyourlan_mcp_agent.py`](../watchyourlan_mcp_agent.py).
+[`proxmox_mcp_agent.py`](../agents.d/proxmox_mcp_agent.py),
+[`synology_mcp_agent.py`](../agents.d/synology_mcp_agent.py),
+[`linux_mcp_agent.py`](../agents.d/linux_mcp_agent.py),
+[`homeassistant_mcp_agent.py`](../agents.d/homeassistant_mcp_agent.py),
+[`watchyourlan_mcp_agent.py`](../agents.d/watchyourlan_mcp_agent.py).
 
 A minimal **JSON-RPC 2.0 client for the MCP `2024-11-05` protocol**, speaking
 over a child process's stdio (`subprocess.Popen`). The orchestrator reuses the

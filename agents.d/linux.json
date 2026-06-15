@@ -1,0 +1,15 @@
+{
+  "name": "linux",
+  "order": 30,
+  "enabled": true,
+  "tool_name": "ask_linux",
+  "module": "linux_mcp_agent",
+  "start_fn": "start_docker",
+  "summary": "manages Linux servers via SSH (shell commands, services, logs, processes, packages, system monitoring)",
+  "tool_description": "Delegate a task to the Linux SSH fleet agent. Use for anything that requires SSH access to Linux servers: running shell commands, checking services, reading logs, managing processes, installing packages, or monitoring system resources on any of the configured Linux hosts.",
+  "query_description": "The full task or question for the Linux SSH fleet agent.",
+  "system_prompt": "You are a Linux systems administrator assistant with SSH access to a fleet of servers. Configured servers: {ctx:servers}. Use the available tools to manage, monitor, and troubleshoot the Linux servers. Confirm destructive operations before executing. Prefer parallel execution when running commands on multiple servers.",
+  "status_line": "Linux servers     : {ctx:servers}",
+  "max_tokens": null,
+  "max_tool_result_chars": null
+}

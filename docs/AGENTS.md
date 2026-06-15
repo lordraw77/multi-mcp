@@ -32,16 +32,44 @@ The hub. Routes requests to the five sub-agents and owns provider rotation.
 
 **Sub-agent execution**
 
-- `run_mcp_query(domain, start_docker_fn, next_client, system_prompt, query, …)`
+- `run_mcp_query(domain, mcp_module, start_docker_fn, next_client, system_prompt, query, …)`
   — the generic sub-agent runner: spawns the MCP process, forwards its stderr,
   runs the inner agentic loop with shared rotation, returns the final text.
-  Supports `max_tokens` and `max_tool_result_chars` (truncation) for the
-  autonomous agents.
-- `ask_proxmox`, `ask_synology`, `ask_linux`, `ask_homeassistant`,
-  `ask_watchyourlan` — thin wrappers around `run_mcp_query` with each domain's
-  system prompt and launcher.
-- `ORCHESTRATOR_TOOLS` / `SYSTEM_PROMPT` — the five tool definitions and the
-  orchestrator persona handed to the LLM.
+  Uses `mcp_module` (the sub-agent's own module) for the shared MCP helpers, and
+  supports `max_tokens` and `max_tool_result_chars` (truncation).
+- `AGENTS` — the registry, built at import by `agent_registry.load_agents()` from
+  `agents.d/*.json` (see below). `ORCHESTRATOR_TOOLS`, `DISPATCH` and
+  `SYSTEM_PROMPT` are all derived from it, so the set of agents is config-driven —
+  no hardcoded `ask_*` functions.
+
+**Sub-agent registry (`agent_registry.py` + `agents.d/`)**
+
+Each sub-agent is one JSON file in `agents.d/` (override the dir with
+`MAIN_AGENT_AGENTS_DIR`). Add/remove an agent = add/remove a file — no code change,
+no image rebuild (the folder is bind-mountable in Docker).
+
+| Field | Meaning |
+|-------|---------|
+| `name`, `order`, `enabled` | id, sort key, on/off (`*.json.disabled` also skips it). |
+| `tool_name`, `module` / `module_path`, `start_fn` | OpenAI tool name; module to import **by name** (`module`) or **by file** (`module_path`, abs or relative to the agents dir); launcher (`start_docker` / `start_proxy`). |
+| `summary`, `tool_description`, `query_description` | bullet for `SYSTEM_PROMPT` / tool description / `query` parameter description shown to the LLM. |
+| `system_prompt`, `status_line` | sub-agent prompt and CLI banner line. |
+| `max_tokens`, `max_tool_result_chars` | optional per-agent limits. |
+
+Placeholders in `system_prompt` / `status_line`: `{env:VAR}`, `{env:VAR:default}`,
+and `{ctx:key}` (resolved from the module's optional `prompt_context()` — Linux uses
+it for the server list). `load_agents()` skips malformed files / unimportable
+modules with a `[warn]`, never crashing the orchestrator.
+
+**Externalized agents (code + config, no rebuild).** The agents dir is added to
+`sys.path`, so a brand-new agent can ship as a `.py` dropped next to its `.json`
+in the (bind-mounted) folder — both `module: my_agent` and
+`module_path: my_agent.py` resolve there. The `.py` only needs the launcher plus
+the four MCP helpers the orchestrator calls; import them from
+[`mcp_common.py`](../mcp_common.py) (`MCPClient`, `tools_to_openai`,
+`mcp_result_to_text`, `assistant_msg`, `docker_start`) instead of copying the
+boilerplate. See [`agents.d/example_agent.py`](../agents.d/example_agent.py) +
+[`agents.d/example.json.disabled`](../agents.d/example.json.disabled) for a template.
 
 **Error classification** (shared by the sidecar and REPL):
 

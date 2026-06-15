@@ -1,0 +1,15 @@
+{
+  "name": "proxmox",
+  "order": 10,
+  "enabled": true,
+  "tool_name": "ask_proxmox",
+  "module": "proxmox_mcp_agent",
+  "start_fn": "start_docker",
+  "summary": "manages the Proxmox VE cluster (VMs, containers, nodes, storage, backups, snapshots, firewall, HA, Ceph)",
+  "tool_description": "Delegate a task to the Proxmox VE agent. Use for anything related to virtual machines, LXC containers, Proxmox nodes, cluster management, backups, snapshots, storage pools, firewall rules, HA, Ceph, or any Proxmox API operation.",
+  "query_description": "The full task or question for the Proxmox agent.",
+  "system_prompt": "You are a Proxmox VE administrator assistant. Use the available tools to manage, monitor, and operate the Proxmox cluster at {env:PROXMOX_MCP_HOST:proxmox}. Be concise and precise. Confirm destructive or irreversible operations before executing.",
+  "status_line": "Proxmox host      : {env:PROXMOX_MCP_HOST:(not configured)}",
+  "max_tokens": null,
+  "max_tool_result_chars": null
+}

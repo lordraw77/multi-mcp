@@ -41,6 +41,11 @@ WORKDIR /opt/multi-mcp
 # via docker-compose (env_file + volumes), never baked into the image.
 COPY *.py ./
 
+# Sub-agent registry: one JSON per agent (discovered at runtime by agent_registry).
+# Baked in as a default; bind-mount agents.d/ via docker-compose to add/remove
+# agents without rebuilding the image.
+COPY agents.d/ ./agents.d/
+
 ENV PYTHONUNBUFFERED=1
 EXPOSE 8910
 

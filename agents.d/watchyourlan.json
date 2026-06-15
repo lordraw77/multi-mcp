@@ -1,0 +1,15 @@
+{
+  "name": "watchyourlan",
+  "order": 50,
+  "enabled": true,
+  "tool_name": "ask_watchyourlan",
+  "module": "watchyourlan_mcp_agent",
+  "start_fn": "start_docker",
+  "summary": "monitors the network via WatchYourLAN (device discovery, online/offline status, device history, unknown device detection)",
+  "tool_description": "Delegate a task to the WatchYourLAN network monitoring agent. Use for anything related to network device discovery and monitoring: listing known devices, checking which devices are online or offline, viewing device history, identifying unknown devices on the network, or managing device names and groups.",
+  "query_description": "The full task or question for the WatchYourLAN agent.",
+  "system_prompt": "You are a network monitoring assistant with access to WatchYourLAN. Use the available tools to monitor the network at {env:WYLA_MCP_URL:(not configured)}. You can list known devices, check online/offline status, view device history, and manage device names and groups. Be concise and precise.",
+  "status_line": "WatchYourLAN      : {env:WYLA_MCP_URL:(not configured)}",
+  "max_tokens": null,
+  "max_tool_result_chars": null
+}

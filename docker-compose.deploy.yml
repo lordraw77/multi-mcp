@@ -1,0 +1,62 @@
+# Multi-MCP Orchestrator — DEPLOY su un altro server (immagine prebuilt).
+#
+# A differenza di docker-compose.yml (che fa `build:` dal sorgente), questo file
+# NON richiede il repo sul server di destinazione: scarica l'immagine già pronta
+# da Docker Hub. Serve copiare solo DUE file sul server target:
+#   • questo docker-compose.deploy.yml
+#   • il tuo .env (con MAIN_AGENT_*, PROXMOX_MCP_*, SYNOLOGY_*, UXMCP_*, HAOS_*, WYLA_*)
+#
+# I sub-agent (config + codice) sono già inclusi nell'immagine sotto agents.d/.
+# Copia anche la cartella agents.d/ sul server SOLO se vuoi personalizzarli senza
+# rebuild (vedi il volume opzionale qui sotto).
+#
+# Pubblicazione immagine (una volta, sulla macchina di build):
+#   make docker-release VERSION=v1.0.0
+#
+# Sul server di destinazione:
+#   docker compose -f docker-compose.deploy.yml pull
+#   docker compose -f docker-compose.deploy.yml up -d
+#   docker compose -f docker-compose.deploy.yml logs -f
+#   curl http://localhost:8910/health        # {"status":"ok",...}
+#
+# L'orchestrator lancia gli MCP sub-agent sul daemon Docker dell'HOST
+# (Docker-out-of-Docker): girano come container fratelli, come nella CLI.
+services:
+  orchestrator:
+    # Tag fissabile da .env: ORCH_IMAGE=lordraw/multi-mcp-orchestrator:v1.0.0
+    image: ${ORCH_IMAGE:-lordraw/multi-mcp-orchestrator:latest}
+    container_name: multi-mcp-orchestrator
+    restart: unless-stopped
+    working_dir: /opt/multi-mcp
+    ports:
+      - "${ORCH_PORT:-8910}:8910"
+    env_file:
+      - .env                       # MAIN_AGENT_*, PROXMOX_MCP_*, SYNOLOGY_*, UXMCP_*, HAOS_*, WYLA_*
+    volumes:
+      # Daemon Docker dell'host — necessario per avviare i container sub-agent MCP.
+      - /var/run/docker.sock:/var/run/docker.sock
+
+      # ── Opzionale: personalizzare i sub-agent senza rebuild ─────────────────
+      # agents.d/ contiene SIA la config (*.json) SIA il codice (*_mcp_agent.py).
+      # L'immagine la include già. Montandola, la cartella dell'host SOSTITUISCE
+      # quella interna: deve quindi essere COMPLETA (copia l'agents.d/ del repo e
+      # aggiungi/togli/modifica gli agent lì). In alternativa punta altrove con
+      # MAIN_AGENT_AGENTS_DIR. Read-only va bene.
+      #   - ./agents.d:/opt/multi-mcp/agents.d:ro
+
+      # ── Opzionali, solo se usi questi sub-agent ─────────────────────────────
+      # I bind-mount DooD sono risolti dal daemon HOST e i sub-agent calcolano il
+      # path sorgente dal code dir (/opt/multi-mcp). Questi file DEVONO esistere
+      # sull'host al MEDESIMO path assoluto usato qui sotto.
+      #
+      # Synology con nas_config.json (SYNOLOGY_MCP_NAS_CONFIG=nas_config.json):
+      #   - /opt/multi-mcp/nas_config.json:/opt/multi-mcp/nas_config.json:ro
+      #
+      # Linux SSH key auth (UXMCP_MCP_SSH_KEY_DIR=/opt/multi-mcp/.ssh in .env):
+      #   - /opt/multi-mcp/.ssh:/opt/multi-mcp/.ssh:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0) if urllib.request.urlopen('http://localhost:8910/health').status==200 else sys.exit(1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

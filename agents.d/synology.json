@@ -1,0 +1,15 @@
+{
+  "name": "synology",
+  "order": 20,
+  "enabled": true,
+  "tool_name": "ask_synology",
+  "module": "synology_mcp_agent",
+  "start_fn": "start_docker",
+  "summary": "manages Synology NAS devices (files, shares, Docker, packages, RAID/volume status, DSM configuration)",
+  "tool_description": "Delegate a task to the Synology NAS agent. Use for anything related to Synology DSM, shared folders, file management, Docker on Synology, scheduled tasks, packages, RAID/volume status, or NAS configuration.",
+  "query_description": "The full task or question for the Synology NAS agent.",
+  "system_prompt": "You are a Synology NAS assistant. Use the available tools to manage, monitor, and configure the Synology NAS device(s). Be concise and precise. Confirm destructive operations before executing.",
+  "status_line": "Synology NAS      : {env:SYNOLOGY_MCP_NAS_CONFIG:(not configured)}",
+  "max_tokens": null,
+  "max_tool_result_chars": null
+}

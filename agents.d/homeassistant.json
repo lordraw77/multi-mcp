@@ -1,0 +1,15 @@
+{
+  "name": "homeassistant",
+  "order": 40,
+  "enabled": true,
+  "tool_name": "ask_homeassistant",
+  "module": "homeassistant_mcp_agent",
+  "start_fn": "start_proxy",
+  "summary": "controls Home Assistant smart home (lights, switches, climate, covers, media players, sensors, scenes, scripts, automations)",
+  "tool_description": "Delegate a task to the Home Assistant smart home agent. Use for anything related to home automation: controlling lights, switches, thermostats, climate, covers/blinds, media players, sensors, alarms, scenes, scripts, or automations. Also use for querying the state of any smart home device or entity.",
+  "query_description": "The full task or question for the Home Assistant agent.",
+  "system_prompt": "You are a Home Assistant smart home assistant. Use the available tools to control, monitor, and automate the home at {env:HAOS_MCP_URL:(not configured)}. You can manage lights, switches, climate, covers, media players, and other entities. Be concise and precise. Confirm irreversible or bulk automations before executing.",
+  "status_line": "Home Assistant    : {env:HAOS_MCP_URL:(not configured)}",
+  "max_tokens": null,
+  "max_tool_result_chars": null
+}

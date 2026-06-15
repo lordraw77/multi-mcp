@@ -1,7 +1,8 @@
 AGENT_HOST  ?= 0.0.0.0
 AGENT_PORT  ?= 8910
 IMAGE       ?= lordraw/multi-mcp-orchestrator
-VERSION     ?= latest
+# Version derived from the latest git tag (fallback: "latest" if no tags exist).
+VERSION     ?= $(shell git describe --tags --abbrev=0 2>/dev/null || echo latest)
 
 .PHONY: cli agent-orchestrator install-agent-server \
         docker-build docker-up docker-down docker-logs docker-push docker-release
@@ -36,8 +37,10 @@ docker-logs:
 docker-push:
 	docker push $(IMAGE):$(VERSION)
 
-# Build, tag latest + version, push — usage: make docker-release VERSION=v1.0.0
+# Build, tag latest + version (from last git tag), push both.
+# Override with: make docker-release VERSION=v1.0.0
 docker-release: docker-build
+	@echo "Releasing $(IMAGE):$(VERSION) (+ latest)"
 	docker tag $(IMAGE):$(VERSION) $(IMAGE):latest
 	docker push $(IMAGE):$(VERSION)
 	docker push $(IMAGE):latest

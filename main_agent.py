@@ -9,6 +9,7 @@ import os
 import sys
 import json
 import itertools
+import importlib
 from itertools import zip_longest
 import threading
 from pathlib import Path
@@ -21,13 +22,13 @@ from openai import OpenAI
 
 from nvidia_ratelimit import wrap_if_nvidia
 
-# ── Sub-agent modules (reuse Docker launchers, MCPClient, helpers) ─────────────
+import agent_registry
+
+# Sub-agent modules are no longer imported statically here — they are discovered
+# and imported at runtime from agents.d/*.json (see agent_registry). The shared
+# MCP protocol helpers (MCPClient, tools_to_openai, assistant_msg, mcp_result_to_text)
+# are identical across every *_mcp_agent module, so each sub-agent supplies its own.
 sys.path.insert(0, str(Path(__file__).parent))
-import proxmox_mcp_agent as _proxmox               # P = "PROXMOX_MCP"
-import synology_mcp_agent as _synology              # P = "SYNOLOGY_MCP"
-import linux_mcp_agent as _linux                    # P = "UXMCP"
-import homeassistant_mcp_agent as _homeassistant    # P = "HAOS_MCP"
-import watchyourlan_mcp_agent as _watchyourlan      # P = "WYLA_MCP"
 
 # ── Env ───────────────────────────────────────────────────────────────────────
 load_dotenv(Path(__file__).parent / ".env", override=True)
@@ -286,6 +287,7 @@ def _is_fatal_error(exc: BadRequestError) -> tuple[bool, str]:
 
 def run_mcp_query(
     domain: str,
+    mcp_module,
     start_docker_fn,
     next_client: NextClient,
     system_prompt: str,
@@ -296,7 +298,11 @@ def run_mcp_query(
 ) -> str:
     """Spawn a sub-agent process, run one query through its MCP tools,
     return the final text answer. next_client() is called before each LLM call
-    so the rotation cycle is shared with the orchestrator."""
+    so the rotation cycle is shared with the orchestrator.
+
+    ``mcp_module`` is the sub-agent's own module, used for the (identical across
+    agents) MCP protocol helpers: MCPClient, tools_to_openai, assistant_msg,
+    mcp_result_to_text."""
     proc = start_docker_fn()
 
     def _fwd_stderr() -> None:
@@ -309,12 +315,13 @@ def run_mcp_query(
 
     threading.Thread(target=_fwd_stderr, daemon=True).start()
 
-    # MCPClient is identical across all three modules — reuse the proxmox copy
-    mcp = _proxmox.MCPClient(proc)
+    # MCPClient/helpers are identical across every *_mcp_agent module — use the
+    # sub-agent's own copy so there is no hard dependency on any single module.
+    mcp = mcp_module.MCPClient(proc)
     try:
         mcp.initialize()
         tools = mcp.list_tools()
-        openai_tools = _proxmox.tools_to_openai(tools)
+        openai_tools = mcp_module.tools_to_openai(tools)
         messages: list[dict] = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": query},
@@ -342,7 +349,7 @@ def run_mcp_query(
                 raise
 
             msg = response.choices[0].message
-            messages.append(_proxmox.assistant_msg(msg))
+            messages.append(mcp_module.assistant_msg(msg))
 
             if not msg.tool_calls:
                 return msg.content or "(no response)"
@@ -367,7 +374,7 @@ def run_mcp_query(
 
                 try:
                     result = mcp.call_tool(fn, args)
-                    result_text = _proxmox.mcp_result_to_text(result)
+                    result_text = mcp_module.mcp_result_to_text(result)
                 except Exception as exc:
                     result_text = f"Tool error: {exc}"
 
@@ -383,231 +390,21 @@ def run_mcp_query(
         mcp.close()
 
 
-# ── Sub-agent handlers ────────────────────────────────────────────────────────
-def ask_proxmox(query: str, next_client: NextClient, drop_provider: Optional[DropProvider] = None, max_tokens: Optional[int] = None, max_tool_result_chars: Optional[int] = None) -> str:
-    host = os.getenv("PROXMOX_MCP_HOST", "proxmox")
-    return run_mcp_query(
-        "proxmox",
-        _proxmox.start_docker,
-        next_client,
-        (
-            "You are a Proxmox VE administrator assistant. Use the available tools to manage, "
-            f"monitor, and operate the Proxmox cluster at {host}. "
-            "Be concise and precise. Confirm destructive or irreversible operations before executing."
-        ),
-        query,
-        drop_provider=drop_provider,
-        max_tokens=max_tokens,
-        max_tool_result_chars=max_tool_result_chars,
-    )
+# ── Sub-agent registry (discovered & imported from agents.d/*.json) ───────────
+# Add/remove an agent = add/remove a JSON file — no code change here, no rebuild
+# (bind-mount agents.d/ in Docker). See agent_registry for the schema.
+AGENTS = agent_registry.load_agents(run_mcp_query)
+ORCHESTRATOR_TOOLS = [a.tool_def for a in AGENTS]
+DISPATCH = {a.tool_name: a.handler for a in AGENTS}
 
-
-def ask_synology(query: str, next_client: NextClient, drop_provider: Optional[DropProvider] = None, max_tokens: Optional[int] = None, max_tool_result_chars: Optional[int] = None) -> str:
-    return run_mcp_query(
-        "synology",
-        _synology.start_docker,
-        next_client,
-        (
-            "You are a Synology NAS assistant. Use the available tools to manage, monitor, "
-            "and configure the Synology NAS device(s). "
-            "Be concise and precise. Confirm destructive operations before executing."
-        ),
-        query,
-        drop_provider=drop_provider,
-        max_tokens=max_tokens,
-        max_tool_result_chars=max_tool_result_chars,
-    )
-
-
-def ask_linux(query: str, next_client: NextClient, drop_provider: Optional[DropProvider] = None, max_tokens: Optional[int] = None, max_tool_result_chars: Optional[int] = None) -> str:
-    servers = _linux.list_configured_servers()
-    server_list = ", ".join(s.split("(")[0].strip() for s in servers) or "none configured"
-    return run_mcp_query(
-        "linux",
-        _linux.start_docker,
-        next_client,
-        (
-            "You are a Linux systems administrator assistant with SSH access to a fleet of servers. "
-            f"Configured servers: {server_list}. "
-            "Use the available tools to manage, monitor, and troubleshoot the Linux servers. "
-            "Confirm destructive operations before executing. "
-            "Prefer parallel execution when running commands on multiple servers."
-        ),
-        query,
-        drop_provider=drop_provider,
-        max_tokens=max_tokens,
-        max_tool_result_chars=max_tool_result_chars,
-    )
-
-
-def ask_homeassistant(query: str, next_client: NextClient, drop_provider: Optional[DropProvider] = None, max_tokens: Optional[int] = None, max_tool_result_chars: Optional[int] = None) -> str:
-    ha_url = os.getenv("HAOS_MCP_URL", "(not configured)")
-    return run_mcp_query(
-        "homeassistant",
-        _homeassistant.start_proxy,
-        next_client,
-        (
-            "You are a Home Assistant smart home assistant. Use the available tools to control, "
-            f"monitor, and automate the home at {ha_url}. "
-            "You can manage lights, switches, climate, covers, media players, and other entities. "
-            "Be concise and precise. Confirm irreversible or bulk automations before executing."
-        ),
-        query,
-        drop_provider=drop_provider,
-        max_tokens=max_tokens,
-        max_tool_result_chars=max_tool_result_chars,
-    )
-
-
-def ask_watchyourlan(query: str, next_client: NextClient, drop_provider: Optional[DropProvider] = None, max_tokens: Optional[int] = None, max_tool_result_chars: Optional[int] = None) -> str:
-    wyl_url = os.getenv("WYLA_MCP_URL", "(not configured)")
-    return run_mcp_query(
-        "watchyourlan",
-        _watchyourlan.start_docker,
-        next_client,
-        (
-            "You are a network monitoring assistant with access to WatchYourLAN. "
-            f"Use the available tools to monitor the network at {wyl_url}. "
-            "You can list known devices, check online/offline status, view device history, "
-            "and manage device names and groups. Be concise and precise."
-        ),
-        query,
-        drop_provider=drop_provider,
-        max_tokens=max_tokens,
-        max_tool_result_chars=max_tool_result_chars,
-    )
-
-# ── Orchestrator tool definitions ─────────────────────────────────────────────
-ORCHESTRATOR_TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "ask_proxmox",
-            "description": (
-                "Delegate a task to the Proxmox VE agent. Use for anything related to "
-                "virtual machines, LXC containers, Proxmox nodes, cluster management, "
-                "backups, snapshots, storage pools, firewall rules, HA, Ceph, or any "
-                "Proxmox API operation."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "The full task or question for the Proxmox agent.",
-                    }
-                },
-                "required": ["query"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "ask_synology",
-            "description": (
-                "Delegate a task to the Synology NAS agent. Use for anything related to "
-                "Synology DSM, shared folders, file management, Docker on Synology, "
-                "scheduled tasks, packages, RAID/volume status, or NAS configuration."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "The full task or question for the Synology NAS agent.",
-                    }
-                },
-                "required": ["query"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "ask_linux",
-            "description": (
-                "Delegate a task to the Linux SSH fleet agent. Use for anything that "
-                "requires SSH access to Linux servers: running shell commands, checking "
-                "services, reading logs, managing processes, installing packages, or "
-                "monitoring system resources on any of the configured Linux hosts."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "The full task or question for the Linux SSH fleet agent.",
-                    }
-                },
-                "required": ["query"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "ask_homeassistant",
-            "description": (
-                "Delegate a task to the Home Assistant smart home agent. Use for anything "
-                "related to home automation: controlling lights, switches, thermostats, climate, "
-                "covers/blinds, media players, sensors, alarms, scenes, scripts, or automations. "
-                "Also use for querying the state of any smart home device or entity."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "The full task or question for the Home Assistant agent.",
-                    }
-                },
-                "required": ["query"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "ask_watchyourlan",
-            "description": (
-                "Delegate a task to the WatchYourLAN network monitoring agent. Use for anything "
-                "related to network device discovery and monitoring: listing known devices, "
-                "checking which devices are online or offline, viewing device history, "
-                "identifying unknown devices on the network, or managing device names and groups."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "The full task or question for the WatchYourLAN agent.",
-                    }
-                },
-                "required": ["query"],
-            },
-        },
-    },
-]
+# The orchestrator serializes its own assistant messages with assistant_msg(),
+# identical across every *_mcp_agent module. Borrow it from any loaded agent,
+# with a safe fallback so the module still imports when agents.d/ is empty.
+_MCP = AGENTS[0].module if AGENTS else importlib.import_module("proxmox_mcp_agent")
 
 
 # ── Reusable orchestrator (shared by the CLI REPL and the HTTP sidecar) ───────
-SYSTEM_PROMPT = (
-    "You are an infrastructure and smart home orchestrator with access to five specialized agents:\n"
-    "• ask_proxmox       — manages the Proxmox VE cluster (VMs, containers, nodes, "
-    "storage, backups, snapshots, firewall, HA, Ceph)\n"
-    "• ask_synology      — manages Synology NAS devices (files, shares, Docker, packages, "
-    "RAID/volume status, DSM configuration)\n"
-    "• ask_linux         — manages Linux servers via SSH (shell commands, services, logs, "
-    "processes, packages, system monitoring)\n"
-    "• ask_homeassistant — controls Home Assistant smart home (lights, switches, climate, "
-    "covers, media players, sensors, scenes, scripts, automations)\n"
-    "• ask_watchyourlan  — monitors the network via WatchYourLAN (device discovery, "
-    "online/offline status, device history, unknown device detection)\n\n"
-    "Analyze each user request and delegate to the appropriate agent(s). "
-    "You may call multiple agents in sequence when a task spans domains. "
-    "Present the agents' responses clearly and concisely."
-)
+SYSTEM_PROMPT = agent_registry.build_system_prompt(AGENTS)
 
 
 class Orchestrator:
@@ -651,13 +448,7 @@ class Orchestrator:
         if not self.rotating:
             self._fixed_client, self.tool_model = build_client(self.provider)
 
-        self.dispatch = {
-            "ask_proxmox": ask_proxmox,
-            "ask_synology": ask_synology,
-            "ask_linux": ask_linux,
-            "ask_homeassistant": ask_homeassistant,
-            "ask_watchyourlan": ask_watchyourlan,
-        }
+        self.dispatch = DISPATCH
 
         # Per-turn rotation state (reset at the start of every run_turn)
         self._pool: list[tuple[OpenAI, str, str]] = []
@@ -749,7 +540,7 @@ class Orchestrator:
                     return f"[error] {cur_provider} API error {getattr(exc, 'status_code', '?')}: {exc}"
 
                 msg = response.choices[0].message
-                messages.append(_proxmox.assistant_msg(msg))
+                messages.append(_MCP.assistant_msg(msg))
 
                 if not msg.tool_calls:
                     if self.chat_llm:
@@ -860,15 +651,8 @@ def main() -> None:
         print(f"  [{reason}] Provider '{cur_provider}' rimosso dalla rotazione. Attivi: {remaining}")
         return True
 
-    dispatch = {
-        "ask_proxmox": ask_proxmox,
-        "ask_synology": ask_synology,
-        "ask_linux": ask_linux,
-        "ask_homeassistant": ask_homeassistant,
-        "ask_watchyourlan": ask_watchyourlan,
-    }
+    dispatch = DISPATCH
 
-    linux_servers = _linux.list_configured_servers()
     if rotating:
         names = ", ".join(label for _, _, label in active_pool)
         print(f"[*] Multi-MCP Orchestrator — modalità rotazione: {names}")
@@ -877,30 +661,11 @@ def main() -> None:
             print(f"[*] Multi-MCP Orchestrator — provider: {cur_provider} — tool model: {model} — chat model: {chat_model_name}")
         else:
             print(f"[*] Multi-MCP Orchestrator — provider: {cur_provider} — model: {model}")
-    print(f"[*] Proxmox host      : {os.getenv('PROXMOX_MCP_HOST', '(not configured)')}")
-    print(f"[*] Synology NAS      : {os.getenv('SYNOLOGY_MCP_NAS_CONFIG', '(not configured)')}")
-    print(f"[*] Linux servers     : {len(linux_servers)} configured")
-    for s in linux_servers:
-        print(f"    • {s}")
-    print(f"[*] Home Assistant    : {os.getenv('HAOS_MCP_URL', '(not configured)')}")
-    print(f"[*] WatchYourLAN      : {os.getenv('WYLA_MCP_URL', '(not configured)')}")
+    print(f"[*] Agents ({len(AGENTS)})         : {', '.join(a.tool_name for a in AGENTS) or '(none)'}")
+    for a in AGENTS:
+        print(f"[*] {a.status_line}")
 
-    system_prompt = (
-        "You are an infrastructure and smart home orchestrator with access to five specialized agents:\n"
-        "• ask_proxmox       — manages the Proxmox VE cluster (VMs, containers, nodes, "
-        "storage, backups, snapshots, firewall, HA, Ceph)\n"
-        "• ask_synology      — manages Synology NAS devices (files, shares, Docker, packages, "
-        "RAID/volume status, DSM configuration)\n"
-        "• ask_linux         — manages Linux servers via SSH (shell commands, services, logs, "
-        "processes, packages, system monitoring)\n"
-        "• ask_homeassistant — controls Home Assistant smart home (lights, switches, climate, "
-        "covers, media players, sensors, scenes, scripts, automations)\n"
-        "• ask_watchyourlan  — monitors the network via WatchYourLAN (device discovery, "
-        "online/offline status, device history, unknown device detection)\n\n"
-        "Analyze each user request and delegate to the appropriate agent(s). "
-        "You may call multiple agents in sequence when a task spans domains. "
-        "Present the agents' responses clearly and concisely."
-    )
+    system_prompt = SYSTEM_PROMPT
     messages: list[dict] = [{"role": "system", "content": system_prompt}]
 
     print("\nType your request (or 'exit' / 'quit' to stop).\n")
@@ -960,7 +725,7 @@ def main() -> None:
                 break
 
             msg = response.choices[0].message
-            messages.append(_proxmox.assistant_msg(msg))
+            messages.append(_MCP.assistant_msg(msg))
 
             if not msg.tool_calls:
                 if chat_llm:

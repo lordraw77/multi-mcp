@@ -1,0 +1,15 @@
+{
+  "name": "example",
+  "order": 999,
+  "enabled": false,
+  "tool_name": "ask_example",
+  "module": "example_agent",
+  "start_fn": "start_docker",
+  "summary": "TEMPLATE — an externalized agent (rename to example.json + set enabled:true to activate)",
+  "tool_description": "Delegate a task to the example agent. Replace this with what your agent does.",
+  "query_description": "The full task or question for the example agent.",
+  "system_prompt": "You are an example assistant operating against {env:EXAMPLE_MCP_HOST:(not configured)}. Be concise and precise.",
+  "status_line": "Example          : {env:EXAMPLE_MCP_HOST:(not configured)}",
+  "max_tokens": null,
+  "max_tool_result_chars": null
+}

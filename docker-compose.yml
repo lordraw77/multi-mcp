@@ -22,6 +22,12 @@ services:
       # Host Docker daemon — required to spawn the MCP sub-agent containers.
       - /var/run/docker.sock:/var/run/docker.sock
 
+      # Sub-agent registry — config (*.json) AND code (*_mcp_agent.py) per agent.
+      # Bind-mount the repo's full agents.d/ so you can add/remove/edit agents on
+      # the host and just restart the container (no rebuild). The mount replaces
+      # the image's copy, so keep it complete.
+      - ./agents.d:/opt/multi-mcp/agents.d:ro
+
       # ── Optional, only if you use these sub-agents ──────────────────────────
       # DooD bind-mounts are resolved by the HOST daemon, and the sub-agents
       # compute the source path from the code dir (/opt/multi-mcp). So these
