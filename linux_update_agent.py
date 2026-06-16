@@ -28,9 +28,22 @@ from typing import Optional
 import requests
 from dotenv import load_dotenv
 
-sys.path.insert(0, str(Path(__file__).parent))
+_ROOT = Path(__file__).parent
+_AGENTS_DIR = _ROOT / "agents.d"
+sys.path.insert(0, str(_ROOT))
+sys.path.insert(0, str(_AGENTS_DIR))
+
 import main_agent as _main
+import agent_registry as _registry
 import linux_mcp_agent as _linux
+
+_linux_spec = next(
+    (a for a in _registry.load_agents(_main.run_mcp_query, agents_dir=_AGENTS_DIR) if a.name == "linux"),
+    None,
+)
+if _linux_spec is None:
+    raise RuntimeError("linux agent not found in agents.d/linux.json — cannot start")
+ask_linux = _linux_spec.handler
 
 load_dotenv(Path(__file__).parent / ".env", override=True)
 
@@ -266,7 +279,7 @@ def run_update_cycle(
     print("[update] Phase 1 — checking pending updates on all servers...")
     t0 = time.monotonic()
     try:
-        check_text = _main.ask_linux(
+        check_text = ask_linux(
             _check_query(servers), next_client_fn, drop_provider_fn,
             max_tokens=MAX_TOKENS,
             max_tool_result_chars=MAX_TOOL_RESULT_CHARS,
@@ -299,7 +312,7 @@ def run_update_cycle(
             print(f"[update] Phase 2 — updating {label}...")
             t0 = time.monotonic()
             try:
-                results[label] = _main.ask_linux(
+                results[label] = ask_linux(
                     _update_query(label), next_client_fn, drop_provider_fn,
                     max_tokens=MAX_TOKENS,
                     max_tool_result_chars=MAX_TOOL_RESULT_CHARS,

@@ -221,11 +221,11 @@ def run_health_check(
     Falls back to next_client_fn() if not provided.
     """
     domain_handlers = {
-        "proxmox":       _main.ask_proxmox,
-        "synology":      _main.ask_synology,
-        "linux":         _main.ask_linux,
-        "homeassistant": _main.ask_homeassistant,
-        "watchyourlan":  _main.ask_watchyourlan,
+        "proxmox":       _main.DISPATCH.get("ask_proxmox"),
+        "synology":      _main.DISPATCH.get("ask_synology"),
+        "linux":         _main.DISPATCH.get("ask_linux"),
+        "homeassistant": _main.DISPATCH.get("ask_homeassistant"),
+        "watchyourlan":  _main.DISPATCH.get("ask_watchyourlan"),
     }
 
     ts_start = datetime.now()
@@ -236,8 +236,14 @@ def run_health_check(
     for domain, query in _HEALTH_QUERIES.items():
         print(f"[health] Checking {domain}...")
         t0 = time.monotonic()
+        handler = domain_handlers[domain]
         try:
-            results[domain] = domain_handlers[domain](
+            if handler is None:
+                results[domain] = f"Agent 'ask_{domain}' not registered — check agents.d/"
+                timings[domain] = 0.0
+                print(f"[health] {domain}: skipped (not registered)")
+                continue
+            results[domain] = handler(
                 query, next_client_fn, drop_provider_fn,
                 max_tokens=MAX_TOKENS,
                 max_tool_result_chars=MAX_TOOL_RESULT_CHARS,
