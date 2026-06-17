@@ -180,6 +180,21 @@ users, server settings). Prefix `PLEX_MCP`.
 
 ---
 
+## `zabbix_mcp_agent.py` — Zabbix sub-agent
+
+Infrastructure monitoring via Zabbix (hosts, problems, triggers, alerts, events,
+metrics, maintenance windows). Prefix `ZABBIX_MCP`.
+
+- `start_docker()` launches `lordraw/zabbix-mcp:latest`, mapping `ZABBIX_MCP_URL`
+  → `ZABBIX_URL`, and auth vars (`ZABBIX_MCP_TOKEN` → `ZABBIX_TOKEN`,
+  `ZABBIX_MCP_USER` → `ZABBIX_USER`, `ZABBIX_MCP_PASSWORD` → `ZABBIX_PASSWORD`,
+  optional `ZABBIX_MCP_VERIFY_SSL` → `ZABBIX_VERIFY_SSL`). Token takes priority
+  over user/password when both are set; the launcher raises `ValueError` if neither
+  auth method is fully provided.
+- `_key(var)` — same `MAIN_AGENT_` fallback as the other sub-agents.
+
+---
+
 ## `watchyourlan_mcp_agent.py` — WatchYourLAN sub-agent
 
 Network device discovery & monitoring via WatchYourLAN (online/offline status,

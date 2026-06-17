@@ -93,6 +93,21 @@ HAOS_MCP_URL=http://192.168.1.x:8123
 HAOS_MCP_TOKEN=<long-lived access token>
 ```
 
+### Zabbix (`ZABBIX_MCP_*`)
+
+```ini
+ZABBIX_MCP_URL=http://192.168.0.x/zabbix
+
+# Auth via API token (Zabbix 5.4+, recommended — takes priority over user/password):
+ZABBIX_MCP_TOKEN=<api token>
+# Alternative: user/password (used only when TOKEN is not set):
+# ZABBIX_MCP_USER=Admin
+# ZABBIX_MCP_PASSWORD=<password>
+
+# ZABBIX_MCP_VERIFY_SSL=false        # disable TLS verification (default: true)
+ZABBIX_MCP_DOCKER_IMAGE=lordraw/zabbix-mcp:latest
+```
+
 ### Plex (`PLEX_MCP_*`)
 
 ```ini

@@ -1,0 +1,15 @@
+{
+  "name": "zabbix",
+  "order": 70,
+  "enabled": true,
+  "tool_name": "ask_zabbix",
+  "module": "zabbix_mcp_agent",
+  "start_fn": "start_docker",
+  "summary": "monitors infrastructure via Zabbix (hosts, problems, triggers, alerts, events, metrics, maintenance windows)",
+  "tool_description": "Delegate a task to the Zabbix monitoring agent. Use for anything related to Zabbix: listing monitored hosts, checking active problems and triggers, inspecting alerts and events, querying item metrics, managing maintenance windows, or any Zabbix API operation.",
+  "query_description": "The full task or question for the Zabbix agent.",
+  "system_prompt": "You are a Zabbix infrastructure monitoring assistant. Use the available tools to monitor and query the Zabbix server at {env:ZABBIX_MCP_URL:(not configured)}. You can list hosts, check active problems and triggers, inspect events and alerts, query item metrics, and manage maintenance windows. Be concise and precise.",
+  "status_line": "Zabbix server      : {env:ZABBIX_MCP_URL:(not configured)}",
+  "max_tokens": null,
+  "max_tool_result_chars": null
+}
