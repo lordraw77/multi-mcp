@@ -93,6 +93,17 @@ HAOS_MCP_URL=http://192.168.1.x:8123
 HAOS_MCP_TOKEN=<long-lived access token>
 ```
 
+### Plex (`PLEX_MCP_*`)
+
+```ini
+PLEX_MCP_URL=http://192.168.0.x:32400
+PLEX_MCP_TOKEN=<Plex authentication token>
+PLEX_MCP_DOCKER_IMAGE=lordraw/plex-mcp:latest
+```
+
+Obtain your Plex token: sign in at plex.tv → open any media item → menu →
+"Get Info" → "View XML" → copy `X-Plex-Token` from the URL.
+
 ### WatchYourLAN (`WYLA_MCP_*`)
 
 ```ini

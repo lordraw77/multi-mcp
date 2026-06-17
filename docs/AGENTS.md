@@ -167,6 +167,19 @@ scenes, scripts, automations). Prefix `HAOS_MCP`.
 
 ---
 
+## `plex_mcp_agent.py` — Plex Media Server sub-agent
+
+Manages a Plex Media Server (libraries, media items, playback sessions, playlists,
+users, server settings). Prefix `PLEX_MCP`.
+
+- `start_docker()` launches `lordraw/plex-mcp:latest`, mapping `PLEX_MCP_URL` →
+  `PLEX_SERVER_URL` and `PLEX_MCP_TOKEN` → `PLEX_TOKEN` (the names the container
+  expects). Both are required; the launcher raises `ValueError` if either is absent.
+- `_key(var)` — same `MAIN_AGENT_` fallback as the HA and WatchYourLAN agents,
+  so the Plex agent can share the orchestrator's provider keys.
+
+---
+
 ## `watchyourlan_mcp_agent.py` — WatchYourLAN sub-agent
 
 Network device discovery & monitoring via WatchYourLAN (online/offline status,

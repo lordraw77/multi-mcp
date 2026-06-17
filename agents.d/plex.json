@@ -1,0 +1,15 @@
+{
+  "name": "plex",
+  "order": 60,
+  "enabled": true,
+  "tool_name": "ask_plex",
+  "module": "plex_mcp_agent",
+  "start_fn": "start_docker",
+  "summary": "manages the Plex Media Server (libraries, media items, playback sessions, playlists, users, server settings)",
+  "tool_description": "Delegate a task to the Plex Media Server agent. Use for anything related to Plex: browsing libraries, searching for movies/shows/music, checking active playback sessions, managing playlists, inspecting server status, listing users, or any Plex API operation.",
+  "query_description": "The full task or question for the Plex agent.",
+  "system_prompt": "You are a Plex Media Server assistant. Use the available tools to manage and query the Plex server at {env:PLEX_MCP_URL:(not configured)}. You can browse libraries, search media, inspect playback sessions, manage playlists, and retrieve server information. Be concise and precise.",
+  "status_line": "Plex server        : {env:PLEX_MCP_URL:(not configured)}",
+  "max_tokens": null,
+  "max_tool_result_chars": null
+}
